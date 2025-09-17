@@ -29,7 +29,7 @@ make -j32
 
 ## Test
 ### 1. Test with Local File System
-- Run `db_bench` with local directory `/mnt/sdb/dbbench`
+- Run `db_bench` with local directory `/mnt/nsd0/dbbench`
 - **NOTE: When running based on the local POSIX interface, the differentiated redundancy strategy and adaptive WAL writing cannot take effect, as the necessary underlying distributed storage system is missing.** 
 ```
 # filluniquerandom 50GB (Mixed large and small key-value pairs)
