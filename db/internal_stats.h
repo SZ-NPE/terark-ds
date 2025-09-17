@@ -15,6 +15,7 @@
 
 #include "db/version_set.h"
 #include "rocksdb/terark_namespace.h"
+#include "util/static_index_map.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -108,6 +109,8 @@ class InternalStats {
     INGESTED_NUM_KEYS_TOTAL,
     READ_AMP_LIMIT_SLOWDOWNS,
     READ_AMP_LIMIT_STOPS,
+    GARBAGE_RATIO_LIMIT_STOPS,
+    BLOB_FILE_BYTES_LIMIT_STOPS,
     INTERNAL_CF_STATS_ENUM_MAX,
   };
 
@@ -405,9 +408,34 @@ class InternalStats {
     uint64_t ingest_bytes_flush;  // Bytes written to L0 (Flush)
     uint64_t stall_count;         // Stall count
     // Stats from compaction jobs - bytes written, bytes read, duration.
-    uint64_t compact_bytes_write;
-    uint64_t compact_bytes_read;
-    uint64_t compact_micros;
+
+    // Compact and Flush
+    uint64_t compact_bytes_read = 0;
+    uint64_t compact_bytes_write = 0;
+    uint64_t compact_bytes_rebuild_write = 0;
+    uint64_t compact_bytes_lsm_write = 0;
+    uint64_t compact_micros = 0;
+
+    // Minor compaction
+    uint64_t minor_compact_bytes_read = 0;
+    uint64_t minor_compact_bytes_write = 0;
+    uint64_t minor_compact_bytes_rebuild_write = 0;
+    uint64_t minor_compact_bytes_lsm_write = 0;
+    uint64_t minor_compact_micros = 0;
+
+    // Major compaction
+    uint64_t major_compact_bytes_read = 0;
+    uint64_t major_compact_bytes_write = 0;
+    uint64_t major_compact_bytes_rebuild_write = 0;
+    uint64_t major_compact_bytes_lsm_write = 0;
+    uint64_t major_compact_micros = 0;
+
+    // GC
+    uint64_t gc_bytes_read = 0;
+    uint64_t gc_bytes_write = 0;
+    uint64_t gc_bytes_rebuild_write = 0;
+    uint64_t gc_bytes_lsm_write = 0;
+    uint64_t gc_micros = 0;
     double seconds_up;
 
     // AddFile specific stats
@@ -419,9 +447,26 @@ class InternalStats {
     CFStatsSnapshot()
         : ingest_bytes_flush(0),
           stall_count(0),
-          compact_bytes_write(0),
           compact_bytes_read(0),
+          compact_bytes_write(0),
+          compact_bytes_rebuild_write(0),
+          compact_bytes_lsm_write(0),
           compact_micros(0),
+          minor_compact_bytes_read(0),
+          minor_compact_bytes_write(0),
+          minor_compact_bytes_rebuild_write(0),
+          minor_compact_bytes_lsm_write(0),
+          minor_compact_micros(0),
+          major_compact_bytes_read(0),
+          major_compact_bytes_write(0),
+          major_compact_bytes_rebuild_write(0),
+          major_compact_bytes_lsm_write(0),
+          major_compact_micros(0),
+          gc_bytes_read(0),
+          gc_bytes_write(0),
+          gc_bytes_rebuild_write(0),
+          gc_bytes_lsm_write(0),
+          gc_micros(0),
           seconds_up(0),
           ingest_bytes_addfile(0),
           ingest_files_addfile(0),
@@ -432,9 +477,34 @@ class InternalStats {
       comp_stats.Clear();
       ingest_bytes_flush = 0;
       stall_count = 0;
-      compact_bytes_write = 0;
+      // Compact and Flush
       compact_bytes_read = 0;
+      compact_bytes_write = 0;
+      compact_bytes_rebuild_write = 0;
+      compact_bytes_lsm_write = 0;
       compact_micros = 0;
+
+      // Minor compaction
+      minor_compact_bytes_read = 0;
+      minor_compact_bytes_write = 0;
+      minor_compact_bytes_rebuild_write = 0;
+      minor_compact_bytes_lsm_write = 0;
+      minor_compact_micros = 0;
+
+      // Major compaction
+      major_compact_bytes_read = 0;
+      major_compact_bytes_write = 0;
+      major_compact_bytes_rebuild_write = 0;
+      major_compact_bytes_lsm_write = 0;
+      major_compact_micros = 0;
+
+      // GC
+      gc_bytes_read = 0;
+      gc_bytes_write = 0;
+      gc_bytes_rebuild_write = 0;
+      gc_bytes_lsm_write = 0;
+      gc_micros = 0;
+
       seconds_up = 0;
       ingest_bytes_addfile = 0;
       ingest_files_addfile = 0;

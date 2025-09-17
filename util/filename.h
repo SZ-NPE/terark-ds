@@ -41,7 +41,8 @@ enum FileType {
   kMetaDatabase,
   kIdentityFile,
   kOptionsFile,
-  kSocketFile
+  kSocketFile,
+  kSubLogFile  // parallel wal writing to disaggregated storage
 };
 
 // Return the name of the log file with the specified number

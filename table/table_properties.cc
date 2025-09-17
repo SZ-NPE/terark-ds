@@ -86,12 +86,17 @@ std::string TablePropertiesBase::ToString(const std::string& prop_delim,
                  num_entries != 0 ? 1.0 * raw_value_size / num_entries : 0.0,
                  prop_delim, kv_delim);
 
+  AppendProperty(result, "separated entry count", separated_entry_count,
+                 prop_delim, kv_delim);
+
   AppendProperty(result, "data block size", data_size, prop_delim, kv_delim);
   char index_block_size_str[80];
   snprintf(index_block_size_str, sizeof(index_block_size_str),
            "index block size (user-key? %d, delta-value? %d)",
            static_cast<int>(index_key_is_user_key),
            static_cast<int>(index_value_is_delta_encoded));
+  AppendProperty(result, "use index key block", use_index_key_block, prop_delim,
+                 kv_delim);
   AppendProperty(result, index_block_size_str, index_size, prop_delim,
                  kv_delim);
   if (index_partitions != 0) {
@@ -174,6 +179,7 @@ void TableProperties::Add(const TableProperties& tp) {
   num_deletions += tp.num_deletions;
   num_merge_operands += tp.num_merge_operands;
   num_range_deletions += tp.num_range_deletions;
+  separated_entry_count += tp.separated_entry_count;
 }
 
 const std::string TablePropertiesNames::kDataSize = "rocksdb.data.size";
@@ -220,6 +226,13 @@ const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
 const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
+const std::string TablePropertiesNames::kSeparatedEntryCount =
+    "rocksdb.separated.entry.count";
+const std::string TablePropertiesNames::kUseIndexKeyBlock =
+    "rocksdb.use.index.key.block";
+const std::string TablePropertiesNames::kSSTMetaType = "rocksdb.sst.meta.type";
+const std::string TablePropertiesNames::kBlobSingleKeyBlock =
+    "rocksdb.blob.single.key.block";
 const std::string TablePropertiesNames::kSnapshots =
     "rocksdb.property.snapshots";
 const std::string TablePropertiesNames::kPurpose = "rocksdb.sst.purpose";
@@ -241,6 +254,7 @@ extern const std::string kPropertiesBlock = "rocksdb.properties";
 extern const std::string kPropertiesBlockOldName = "rocksdb.stats";
 extern const std::string kCompressionDictBlock = "rocksdb.compression_dict";
 extern const std::string kRangeDelBlock = "rocksdb.range_del";
+extern const std::string kIndexKeyBlock = "rocksdb.index_key";
 
 // Seek to the properties block.
 // Return true if it successfully seeks to the properties block.
@@ -265,6 +279,12 @@ Status SeekToRangeDelBlock(InternalIteratorBase<Slice>* meta_iter,
                            bool* is_found,
                            BlockHandle* block_handle = nullptr) {
   return SeekToMetaBlock(meta_iter, kRangeDelBlock, is_found, block_handle);
+}
+
+Status SeekToIndexKeyBlock(InternalIteratorBase<Slice>* meta_iter,
+                           bool* is_found,
+                           BlockHandle* block_handle = nullptr) {
+  return SeekToMetaBlock(meta_iter, kIndexKeyBlock, is_found, block_handle);
 }
 
 }  // namespace TERARKDB_NAMESPACE

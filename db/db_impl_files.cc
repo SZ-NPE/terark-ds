@@ -457,6 +457,7 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
     bool keep = true;
     switch (type) {
       case kLogFile:
+      case kSubLogFile:
         keep = ((number >= state.log_number) ||
                 (number == state.prev_log_number) ||
                 (log_recycle_files_set.find(number) !=

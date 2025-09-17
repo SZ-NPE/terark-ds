@@ -276,6 +276,13 @@ class MergingIterator : public InternalIterator {
     return current_->key();
   }
 
+  uint64_t file_number() const override {
+    assert(Valid());
+    return current_->file_number();
+  }
+
+  virtual void fetch_value() { current_->fetch_value(); }
+
   virtual LazyBuffer value() const override {
     assert(Valid());
     return current_->value();

@@ -98,13 +98,13 @@ TEST_F(BlockBasedTableBuilderTest, FunctionTest) {
   std::vector<std::unique_ptr<IntTblPropCollectorFactory>>
       int_tbl_prop_collector_factories;
   std::string column_family_name;
-  int unknown_level = -1;
+  int unknown_level = 0;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, ikc,
                           &int_tbl_prop_collector_factories, kNoCompression,
                           CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name,
-                          unknown_level, 0 /* compaction_load */),
+                          false /* skip_filters */, 0 /* meta_type */,
+                          column_family_name, unknown_level, 0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
   for (char c = 'a'; c <= 'z'; ++c) {
@@ -181,13 +181,13 @@ TEST_P(BlockBasedTableBuilderTest, BoundaryTest) {
                                        moptions.ttl_gc_ratio,
                                        moptions.ttl_max_scan_gap));
   std::string column_family_name;
-  int unknown_level = -1;
+  int unknown_level = 0;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, ikc,
                           &int_tbl_prop_collector_factories, kNoCompression,
                           CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name,
-                          unknown_level, 0 /* compaction_load */),
+                          false /* skip_filters */, 0 /* meta_type */,
+                          column_family_name, unknown_level, 0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
   uint64_t nowseconds = env->NowMicros() / 1000000ul;

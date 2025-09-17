@@ -845,11 +845,15 @@ void CompactionPicker::GetGrandparents(
 // 3. it marked for compaction
 Compaction* CompactionPicker::PickGarbageCollection(
     const std::string& /*cf_name*/, const MutableCFOptions& mutable_cf_options,
+    double dynamic_blob_gc_ratio,
     VersionStorageInfo* vstorage, LogBuffer* /*log_buffer*/) {
   // Setting fragment_size as one eighth target_blob_file_size prevents
   // selecting massive files to single compaction which would pin down the
   // maximum deletable file number for a long time resulting possible storage
   // leakage.
+  double blob_gc_ratio = dynamic_blob_gc_ratio;
+
+
   size_t target_blob_file_size = MaxBlobSize(
       mutable_cf_options, ioptions_.num_levels, ioptions_.compaction_style);
 
@@ -885,7 +889,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
 
   if (dirtiest_blob.f == nullptr ||
       (!dirtiest_blob.f->marked_for_compaction &&
-       dirtiest_blob.score < mutable_cf_options.blob_gc_ratio)) {
+       dirtiest_blob.score < blob_gc_ratio)) {
     return nullptr;
   }
   // Set up inputs for garbage collection.
@@ -941,7 +945,7 @@ Compaction* CompactionPicker::PickGarbageCollection(
     if (f->is_gc_permitted() && !f->being_compacted) {
       GarbageFileInfo gc_blob(f);
       if (gc_blob.estimate_size <= fragment_size ||
-          gc_blob.score >= mutable_cf_options.blob_gc_ratio ||
+          gc_blob.score >= blob_gc_ratio ||
           gc_blob.f->marked_for_compaction) {
         candidate_blob_vec.emplace_back(gc_blob);
       }

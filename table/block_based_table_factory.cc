@@ -376,6 +376,15 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
   snprintf(buffer, kBufferSize, "  block_align: %d\n",
            table_options_.block_align);
   ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  use_index_key_block: %d\n",
+           table_options_.use_index_key_block);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  index_sep_ratio: %f\n",
+           table_options_.index_sep_ratio);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  blob_single_key_block: %d\n",
+           table_options_.blob_single_key_block);
+  ret.append(buffer);
   return ret;
 }
 

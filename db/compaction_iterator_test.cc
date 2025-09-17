@@ -262,7 +262,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         iter_.get(), nullptr, nullptr, cmp_, merge_helper_.get(), last_sequence,
         &snapshots_, earliest_write_conflict_snapshot, snapshot_checker_.get(),
         Env::Default(), false /* report_detailed_time */, false,
-        range_del_agg_.get(), std::move(compaction),
+        range_del_agg_.get(), nullptr, false, std::move(compaction),
         BlobConfig{size_t(-1), 0.0}, filter, &shutting_down_));
   }
 

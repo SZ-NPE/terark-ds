@@ -29,7 +29,8 @@ const size_t kFadviseTrigger = 1024 * 1024;  // 1MB
 struct SstFileWriter::Rep {
   Rep(const EnvOptions& _env_options, const Options& options,
       Env::IOPriority _io_priority, const Comparator* _user_comparator,
-      ColumnFamilyHandle* _cfh, bool _invalidate_page_cache, bool _skip_filters)
+      ColumnFamilyHandle* _cfh, bool _invalidate_page_cache, bool _skip_filters,
+      uint64_t _meta_type)
       : env_options(_env_options),
         ioptions(options),
         mutable_cf_options(options),
@@ -38,7 +39,8 @@ struct SstFileWriter::Rep {
         cfh(_cfh),
         invalidate_page_cache(_invalidate_page_cache),
         last_fadvise_size(0),
-        skip_filters(_skip_filters) {}
+        skip_filters(_skip_filters),
+        meta_type(_meta_type) {}
 
   std::unique_ptr<WritableFileWriter> file_writer;
   std::unique_ptr<TableBuilder> builder;
@@ -58,6 +60,7 @@ struct SstFileWriter::Rep {
   // cached pages from page cache.
   uint64_t last_fadvise_size;
   bool skip_filters;
+  uint64_t meta_type;
   Status Add(const Slice& user_key, const Slice& value,
              const ValueType value_type) {
     if (!builder) {
@@ -163,7 +166,7 @@ SstFileWriter::SstFileWriter(const EnvOptions& env_options,
                              bool invalidate_page_cache,
                              Env::IOPriority io_priority, bool skip_filters)
     : rep_(new Rep(env_options, options, io_priority, user_comparator,
-                   column_family, invalidate_page_cache, skip_filters)) {
+                   column_family, invalidate_page_cache, skip_filters, 0)) {
   rep_->file_info.file_size = 0;
 }
 
@@ -220,7 +223,7 @@ Status SstFileWriter::Open(const std::string& file_path) {
         new UserKeyTablePropertiesCollectorFactory(
             user_collector_factories[i]));
   }
-  int unknown_level = -1;
+  int unknown_level = 0;
   uint32_t cf_id;
 
   if (r->cfh != nullptr) {
@@ -236,8 +239,8 @@ Status SstFileWriter::Open(const std::string& file_path) {
   TableBuilderOptions table_builder_options(
       r->ioptions, r->mutable_cf_options, r->internal_comparator,
       &int_tbl_prop_collector_factories, compression_type, compression_opts,
-      nullptr /* compression_dict */, r->skip_filters, r->column_family_name,
-      unknown_level, 0);
+      nullptr /* compression_dict */, r->skip_filters,
+      r->meta_type, r->column_family_name, unknown_level, 0);
   r->file_writer.reset(
       new WritableFileWriter(std::move(sst_file), file_path, r->env_options,
                              nullptr /* stats */, r->ioptions.listeners));

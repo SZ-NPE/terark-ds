@@ -102,7 +102,11 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       optimize_range_deletion(options.optimize_range_deletion),
       paranoid_file_checks(options.paranoid_file_checks),
       force_consistency_checks(options.force_consistency_checks),
-      report_bg_io_stats(options.report_bg_io_stats) {
+      report_bg_io_stats(options.report_bg_io_stats),
+      garbage_ratio_stop_writes_trigger(
+          options.garbage_ratio_stop_writes_trigger),
+      blob_file_bytes_limit(options.blob_file_bytes_limit),
+      gc_adpative_readahead(options.gc_adpative_readahead) {
   assert(memtable_factory.get() != nullptr);
   if (max_bytes_for_level_multiplier_additional.size() <
       static_cast<unsigned int>(num_levels)) {
@@ -141,6 +145,14 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
       ttl_extractor_factory ? ttl_extractor_factory->Name() : "None");
   ROCKS_LOG_HEADER(log, "       Options.compaction_filter: %s",
                    compaction_filter ? compaction_filter->Name() : "None");
+  ROCKS_LOG_HEADER(log, "          Options.drop_key_cache: %s",
+                   drop_key_cache ? drop_key_cache->Name() : "None");
+  ROCKS_LOG_HEADER(log, "           Options.hotness_aware: %d", hotness_aware);
+  ROCKS_LOG_HEADER(log, "           Options.score_modify: %d", score_modify);
+  ROCKS_LOG_HEADER(log, "           Options.score_modify_advanced: %d",
+                   score_modify_advanced);
+  ROCKS_LOG_HEADER(log, "           Options.compensated_size_optimize: %d",
+                   compensated_size_optimize);
   ROCKS_LOG_HEADER(
       log, "       Options.compaction_filter_factory: %s",
       compaction_filter_factory ? compaction_filter_factory->Name() : "None");
@@ -372,6 +384,13 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    force_consistency_checks);
   ROCKS_LOG_HEADER(log, "                     Options.report_bg_io_stats: %d",
                    report_bg_io_stats);
+  ROCKS_LOG_HEADER(log, "      Options.garbage_ratio_stop_writes_trigger: %f",
+                   garbage_ratio_stop_writes_trigger);
+  ROCKS_LOG_HEADER(log,
+                   "                  Options.blob_file_bytes_limit: %" PRIu64,
+                   blob_file_bytes_limit);
+  ROCKS_LOG_HEADER(log, "                  Options.gc_adpative_readahead: %d",
+                   gc_adpative_readahead);
 }  // ColumnFamilyOptions::Dump
 
 void Options::Dump(Logger* log) const {

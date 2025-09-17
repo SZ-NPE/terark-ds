@@ -126,6 +126,16 @@ struct EnvOptions {
 
   // If not nullptr, write rate limiting is enabled for flush and compaction
   RateLimiter* rate_limiter = nullptr;
+
+#ifdef USE_LOG_STORE
+  bool enable_erasure_coding = true;
+  int ec_packet_size = 2048;
+  int ec_data_units = 4;
+  int ec_parity_units = 2;
+
+  // whether use read only mode to open the blob
+  bool bytestore_read_only = false;
+#endif /* USE_LOG_STORE */
 };
 
 class Env {
@@ -1682,7 +1692,10 @@ Status NewZenfsEnv(
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_);
 
 #ifdef WITH_ZENFS
-Status GetZbdDiskSpaceInfo(Env* env, uint64_t* total, uint64_t* free, uint64_t* used);
+Status GetZbdDiskSpaceInfo(Env* env, uint64_t* total, uint64_t* free,
+                           uint64_t* used);
 #endif
+
+Status NewBytestoreEnv(Env** result, const std::string& uri, bool enable_rdma);
 
 }  // namespace TERARKDB_NAMESPACE

@@ -39,7 +39,8 @@ GetContext::GetContext(const Comparator* ucmp,
                        bool* value_found, MergeContext* merge_context,
                        const SeparateHelper* separate_helper,
                        SequenceNumber* _max_covering_tombstone_seq, Env* env,
-                       SequenceNumber* seq, ReadCallback* callback)
+                       SequenceNumber* seq, ReadCallback* callback,
+                       bool is_getkey_operation)
     : ucmp_(ucmp),
       merge_operator_(merge_operator),
       logger_(logger),
@@ -57,7 +58,8 @@ GetContext::GetContext(const Comparator* ucmp,
       min_seq_type_(0),
       callback_(callback),
       is_index_(false),
-      is_finished_(false) {
+      is_finished_(false),
+      is_getkey_(is_getkey_operation) {
   if (seq_) {
     *seq_ = kMaxSequenceNumber;
   }
@@ -114,6 +116,10 @@ void GetContext::ReportCounters() {
   }
   if (get_context_stats_.num_cache_add > 0) {
     RecordTick(statistics_, BLOCK_CACHE_ADD, get_context_stats_.num_cache_add);
+  }
+  if (get_context_stats_.num_cache_read > 0) {
+    RecordTick(statistics_, BLOCK_CACHE_READ,
+               get_context_stats_.num_cache_read);
   }
   if (get_context_stats_.num_cache_bytes_write > 0) {
     RecordTick(statistics_, BLOCK_CACHE_BYTES_WRITE,

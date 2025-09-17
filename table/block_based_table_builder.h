@@ -57,6 +57,12 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   Status Add(const Slice& key, const LazyBuffer& value) override;
 
+  // Add key,value to the table being constructed.
+  // Full record, record all keys in index block
+  // REQUIRES: key is after any previously added key according to comparator.
+  // REQUIRES: Finish(), Abandon() have not been called
+  Status AddFullRecord(const Slice& key, const LazyBuffer& value);
+
   Status AddTombstone(const Slice& key, const LazyBuffer& value) override;
 
   // Finish building the table.  Stops using the file passed to the
@@ -111,6 +117,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteIndexKeyBlock(MetaIndexBuilder* meta_index_builder);
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;

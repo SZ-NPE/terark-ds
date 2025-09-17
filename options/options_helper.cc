@@ -690,6 +690,12 @@ bool SerializeSingleOptionHelper(const char* opt_address,
       *value = *ptr ? (*ptr)->Name() : kNullptrString;
       break;
     }
+    case OptionType::kDropCache: {
+      // it's a const pointer of const Cache*
+      const auto* ptr = reinterpret_cast<const Cache* const*>(opt_address);
+      *value = *ptr ? (*ptr)->Name() : kNullptrString;
+      break;
+    }
     case OptionType::kCompactionFilterFactory: {
       const auto* ptr =
           reinterpret_cast<const std::shared_ptr<CompactionFilterFactory>*>(
@@ -2144,6 +2150,9 @@ std::unordered_map<std::string, OptionTypeInfo>
          {offset_of(&ColumnFamilyOptions::compaction_filter),
           OptionType::kCompactionFilter, OptionVerificationType::kByName, false,
           0}},
+        {"drop_key_cache",
+         {offset_of(&ColumnFamilyOptions::drop_key_cache),
+          OptionType::kDropCache, OptionVerificationType::kByName, false, 0}},
         {"compaction_filter_factory",
          {offset_of(&ColumnFamilyOptions::compaction_filter_factory),
           OptionType::kCompactionFilterFactory, OptionVerificationType::kByName,

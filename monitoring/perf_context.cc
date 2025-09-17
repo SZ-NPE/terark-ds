@@ -21,6 +21,68 @@ thread_local PerfContext perf_context;
 #endif
 #endif
 
+#if defined(NPERF_CONTEXT) || !defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
+DBOperationType db_operation_type = kOpTypeUndefined;
+#else
+#if defined(OS_SOLARIS)
+__thread DBOperationType db_operation_type = kOpTypeUndefined;
+#else
+thread_local DBOperationType db_operation_type = kOpTypeUndefined;
+#endif
+#endif
+
+DBOperationType get_db_operation_type() { return db_operation_type; }
+
+bool is_foreground_operation() { return db_operation_type == kOpTypeFG; }
+bool is_flush_operation() { return db_operation_type == kOpTypeFlush; }
+bool is_compaction_operation() {
+  return db_operation_type == kOpTypeCompaction;
+}
+bool is_garbage_collenction_operation() {
+  return db_operation_type == kOpTypeGC;
+}
+
+DBOperationTypeGuard::DBOperationTypeGuard(
+    const DBOperationType& _db_operation_type) {
+  db_operation_type = _db_operation_type;
+}
+
+DBOperationTypeGuard::~DBOperationTypeGuard() {
+  db_operation_type = kOpTypeUndefined;
+}
+
+#if defined(NPERF_CONTEXT) || !defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
+BGOperationType bg_operation_type = kOpTypeNotdefined;
+#else
+#if defined(OS_SOLARIS)
+__thread BGOperationType bg_operation_type = kOpTypeNotdefined;
+#else
+thread_local BGOperationType bg_operation_type = kOpTypeNotdefined;
+#endif
+#endif
+
+BGOperationType get_bg_operation_type() { return bg_operation_type; }
+
+bool is_getkey_operation() { return bg_operation_type == kOpTypeGetKey; }
+
+BGOperationTypeGuard::BGOperationTypeGuard(
+    const BGOperationType& _bg_operation_type) {
+  bg_operation_type = _bg_operation_type;
+}
+
+BGOperationTypeGuard::~BGOperationTypeGuard() {
+  bg_operation_type = kOpTypeNotdefined;
+}
+
+void BGOperationTypeGuard::SetOperationType(
+    const BGOperationType& _bg_operation_type) {
+  bg_operation_type = _bg_operation_type;
+}
+
+void BGOperationTypeGuard::ResetOperationType() {
+  bg_operation_type = kOpTypeNotdefined;
+}
+
 PerfContext* get_perf_context() {
 #if defined(NPERF_CONTEXT) || !defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
   return &perf_context;

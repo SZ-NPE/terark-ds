@@ -191,6 +191,7 @@ class DBIter final : public Iterator {
   }
   virtual Slice value() const override {
     assert(valid_);
+    DBOperationTypeGuard op_guard(kOpTypeFG);
     auto s = value_.fetch();
     if (!s.ok()) {
       valid_ = false;
@@ -355,6 +356,7 @@ void DBIter::Next() {
                              ? DummyHistReporterHandle()
                              : (db_impl_->next_qps_reporter().AddCount(1),
                                 &db_impl_->next_latency_reporter()));
+  DBOperationTypeGuard op_guard(kOpTypeFG);
 
   assert(valid_);
   assert(status_.ok());
@@ -687,6 +689,7 @@ void DBIter::Prev() {
                              ? DummyHistReporterHandle()
                              : (db_impl_->prev_qps_reporter().AddCount(1),
                                 &db_impl_->prev_latency_reporter()));
+  DBOperationTypeGuard op_guard(kOpTypeFG);
 
   assert(valid_);
   assert(status_.ok());
@@ -1188,6 +1191,7 @@ void DBIter::Seek(const Slice& target) {
                                 &db_impl_->seek_latency_reporter()));
 
   StopWatch sw(env_, statistics_, DB_SEEK);
+  DBOperationTypeGuard op_guard(kOpTypeFG);
   status_ = Status::OK();
   ResetValueAndCounter();
 
@@ -1252,6 +1256,7 @@ void DBIter::SeekForPrev(const Slice& target) {
                              &db_impl_->seekforprev_latency_reporter()));
 
   StopWatch sw(env_, statistics_, DB_SEEK);
+  DBOperationTypeGuard op_guard(kOpTypeFG);
   status_ = Status::OK();
   ResetValueAndCounter();
   saved_key_.Clear();

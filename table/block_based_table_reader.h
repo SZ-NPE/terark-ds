@@ -35,6 +35,7 @@
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
+#include "util/static_index_map.h"
 
 namespace TERARKDB_NAMESPACE {
 
@@ -251,6 +252,38 @@ class BlockBasedTable : public TableReader {
  private:
   friend class MockedBlockBasedTable;
   static std::atomic<uint64_t> next_cache_key_id_;
+
+  class LazyBufferStateImpl : public LazyBufferState {
+   public:
+    void destroy(LazyBuffer* /*buffer*/) const override {}
+
+    Status pin_buffer(LazyBuffer* buffer) const override {
+      if (buffer->size() <= sizeof(LazyBufferContext)) {
+        buffer->reset(buffer->slice(), true, buffer->file_number());
+        return Status::OK();
+      }
+      auto context = get_context(buffer);
+      DataBlockIter* iter = reinterpret_cast<DataBlockIter*>(context->data[0]);
+      assert(iter != nullptr);
+      Cleanable release_cached_entry = iter->RefCache();
+      if (release_cached_entry.Empty()) {
+        return Status::NotSupported();
+      }
+      buffer->reset(buffer->slice(), std::move(release_cached_entry),
+                    buffer->file_number());
+      return Status::OK();
+    }
+
+    Status fetch_buffer(LazyBuffer* /*buffer*/) const override {
+      return Status::OK();
+    }
+  };
+
+  Status GetKeyFromMap(const ReadOptions& read_options, const Slice& key,
+                       GetContext* get_context,
+                       const SliceTransform* prefix_extractor,
+                       CachableEntry<FilterBlockReader>* filter_entry,
+                       bool no_io);
 
   // If block cache enabled (compressed or uncompressed), looks for the block
   // identified by handle in (1) uncompressed cache, (2) compressed cache, and
@@ -498,6 +531,10 @@ struct BlockBasedTable::Rep {
   // is easier because the Slice member depends on the continued existence of
   // another member ("allocation").
   std::unique_ptr<const BlockContents> compression_dict_block;
+  // Index key map is in memory, used for garbage collection getkey
+  std::unique_ptr<StaticMapIndex> index_key_map;
+  std::unique_ptr<BlockHandle> index_key_handle;
+
   BlockBasedTableOptions::IndexType index_type;
   bool hash_index_allow_collision;
   bool whole_key_filtering;
@@ -554,7 +591,8 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
                               const SliceTransform* prefix_extractor,
                               bool is_index, bool key_includes_seq = true,
                               bool index_key_is_full = true,
-                              bool for_compaction = false)
+                              bool for_compaction = false,
+                              bool gc_accelerate = false)
       : table_(table),
         read_options_(read_options),
         icomp_(icomp),
@@ -566,7 +604,8 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
         is_index_(is_index),
         key_includes_seq_(key_includes_seq),
         index_key_is_full_(index_key_is_full),
-        for_compaction_(for_compaction) {}
+        for_compaction_(for_compaction),
+        gc_accelerate_(gc_accelerate) {}
 
   ~BlockBasedTableIteratorBase() { delete index_iter_; }
 
@@ -577,12 +616,29 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   void Next() override;
   void Prev() override;
   bool Valid() const override {
+    if (gc_accelerate_) {
+      return !is_out_of_bound_ && index_iter_->Valid();
+    }
     return !is_out_of_bound_ && block_iter_points_to_real_block_ &&
            block_iter_.Valid();
   }
   Slice key() const override {
+    if (gc_accelerate_) {
+      assert(index_iter_->Valid());
+      return index_iter_->key();
+    }
     assert(Valid());
     return block_iter_.key();
+  }
+  // return file_number
+  uint64_t file_number() const override { return table_->FileNumber(); }
+  // When validity check is valid, use this function to fetch value actively
+  void fetch_value() override {
+    if (gc_accelerate_) {
+      ResetDataIter();
+      InitDataBlock();
+      block_iter_.SeekToFirst();
+    }
   }
   Status status() const override {
     if (!index_iter_->status().ok()) {
@@ -648,6 +704,8 @@ class BlockBasedTableIteratorBase : public InternalIteratorBase<TValue> {
   bool index_key_is_full_;
   // If this iterator is created for compaction
   bool for_compaction_;
+  // If this iterator is created for gc
+  bool gc_accelerate_;
   BlockHandle prev_index_value_;
 
   static const size_t kInitReadaheadSize = 8 * 1024;

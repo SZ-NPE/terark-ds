@@ -1178,10 +1178,13 @@ void InternalStats::DumpCFMapStatsIOStalls(
       std::to_string(cf_stats_count_[MEMTABLE_LIMIT_STOPS]);
   (*cf_stats)["io_stalls.memtable_slowdown"] =
       std::to_string(cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS]);
+  (*cf_stats)["io_stalls.gc_blob_file_size_stop"] =
+      std::to_string(cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS]);
 
   uint64_t total_stop = cf_stats_count_[L0_FILE_COUNT_LIMIT_STOPS] +
                         cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_STOPS] +
-                        cf_stats_count_[MEMTABLE_LIMIT_STOPS];
+                        cf_stats_count_[MEMTABLE_LIMIT_STOPS] +
+                        cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS];
 
   uint64_t total_slowdown =
       cf_stats_count_[L0_FILE_COUNT_LIMIT_SLOWDOWNS] +
@@ -1231,7 +1234,8 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
       cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_SLOWDOWNS] +
       cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_STOPS] +
       cf_stats_count_[MEMTABLE_LIMIT_STOPS] +
-      cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS];
+      cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS] +
+      cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS];
   // Interval summary
   uint64_t interval_flush_ingest =
       flush_ingest - cf_stats_snapshot_.ingest_bytes_flush;
@@ -1249,6 +1253,9 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
 
   double seconds_up = (env_->NowMicros() - started_at_ + 1) / kMicrosInSec;
   double interval_seconds_up = seconds_up - cf_stats_snapshot_.seconds_up;
+  snprintf(buf, sizeof(buf), "Static index map(GB): %.3f\n",
+           static_cast<double>(StaticMapIndex::index_key_map_size / kGB));
+  value->append(buf);
   snprintf(buf, sizeof(buf), "Uptime(secs): %.1f total, %.1f interval\n",
            seconds_up, interval_seconds_up);
   value->append(buf);
@@ -1281,25 +1288,79 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
            ingest_keys_addfile, interval_ingest_keys_addfile);
   value->append(buf);
 
-  // Compact
+  // Compact and Flush
   uint64_t compact_bytes_read = 0;
   uint64_t compact_bytes_write = 0;
   uint64_t compact_bytes_rebuild_write = 0;
   uint64_t compact_bytes_lsm_write = 0;
   uint64_t compact_micros = 0;
+
+  // Minor compaction
+  uint64_t minor_compact_bytes_read = 0;
+  uint64_t minor_compact_bytes_write = 0;
+  uint64_t minor_compact_bytes_rebuild_write = 0;
+  uint64_t minor_compact_bytes_lsm_write = 0;
+  uint64_t minor_compact_micros = 0;
+
+  // Major compaction
+  uint64_t major_compact_bytes_read = 0;
+  uint64_t major_compact_bytes_write = 0;
+  uint64_t major_compact_bytes_rebuild_write = 0;
+  uint64_t major_compact_bytes_lsm_write = 0;
+  uint64_t major_compact_micros = 0;
+
+  // GC
+  uint64_t gc_bytes_read = 0;
+  uint64_t gc_bytes_write = 0;
+  uint64_t gc_bytes_rebuild_write = 0;
+  uint64_t gc_bytes_lsm_write = 0;
+  uint64_t gc_micros = 0;
+
   for (int level = 0; level < number_levels_; level++) {
     compact_bytes_read += comp_stats_[level].bytes_read_output_level +
                           comp_stats_[level].bytes_read_non_output_levels;
     compact_bytes_rebuild_write += comp_stats_[level].bytes_blob_written;
     compact_bytes_lsm_write += comp_stats_[level].bytes_written;
     compact_micros += comp_stats_[level].micros;
+    if (level == 0) {
+      minor_compact_bytes_read +=
+          comp_stats_[level].bytes_read_output_level +
+          comp_stats_[level].bytes_read_non_output_levels;
+      minor_compact_bytes_rebuild_write +=
+          comp_stats_[level].bytes_blob_written;
+      minor_compact_bytes_lsm_write += comp_stats_[level].bytes_written;
+      minor_compact_micros += comp_stats_[level].micros;
+    }
   }
-  compact_bytes_read += comp_blob_stat_.bytes_read_non_output_levels +
+  compact_bytes_read += comp_blob_stat_.bytes_read_output_level +
                         comp_blob_stat_.bytes_read_non_output_levels;
   compact_bytes_write += comp_blob_stat_.bytes_written +
                          comp_blob_stat_.bytes_blob_written +
                          compact_bytes_rebuild_write + compact_bytes_lsm_write;
   compact_micros += comp_blob_stat_.micros;
+
+  gc_bytes_read = comp_blob_stat_.bytes_read_output_level +
+                  comp_blob_stat_.bytes_read_non_output_levels;
+  gc_bytes_write =
+      comp_blob_stat_.bytes_written + comp_blob_stat_.bytes_blob_written;
+  gc_micros = comp_blob_stat_.micros;
+  gc_bytes_rebuild_write = comp_blob_stat_.bytes_blob_written;
+  gc_bytes_lsm_write = comp_blob_stat_.bytes_written;
+
+  minor_compact_bytes_write +=
+      minor_compact_bytes_rebuild_write + minor_compact_bytes_lsm_write;
+  major_compact_bytes_read =
+      compact_bytes_read - minor_compact_bytes_read - gc_bytes_read;
+  major_compact_bytes_write =
+      compact_bytes_write - minor_compact_bytes_write - gc_bytes_write;
+  major_compact_bytes_rebuild_write =
+      compact_bytes_rebuild_write - minor_compact_bytes_rebuild_write;
+  major_compact_bytes_lsm_write =
+      compact_bytes_lsm_write - minor_compact_bytes_lsm_write;
+  major_compact_micros = compact_micros - minor_compact_micros - gc_micros;
+
+  assert(major_compact_bytes_write ==
+         major_compact_bytes_rebuild_write + major_compact_bytes_lsm_write);
 
   snprintf(buf, sizeof(buf),
            "Cumulative compaction: %.2f GB write, %.2f MB/s write, "
@@ -1311,18 +1372,92 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
 
   snprintf(buf, sizeof(buf),
            "Cumulative compaction: %.2f GB (write-lsm), %.2f GB "
-           "(write-rebuild), %.2f GB (write-gc)",
+           "(write-rebuild), %.2f GB (write-gc)\n",
            compact_bytes_lsm_write / kGB, compact_bytes_rebuild_write / kGB,
            comp_blob_stat_.bytes_blob_written / kGB);
   value->append(buf);
 
+  snprintf(buf, sizeof(buf),
+           "Cumulative minor compaction: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+           "%.2f GB %.2f MB/s minor_compact_bytes_written, "
+           "%.2f GB %.2f MB/s minor_compact_bytes_blob_written\n"
+           "Cumulative major compaction: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+           "%.2f GB %.2f MB/s major_compact_bytes_written, "
+           "%.2f GB %.2f MB/s major_compact_bytes_blob_written\n"
+           "Cumulative gc: "
+           "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+           "%.2f GB %.2f MB/s gc_bytes_written, "
+           "%.2f GB %.2f MB/s gc_bytes_blob_written\n",
+           minor_compact_bytes_write / kGB,
+           minor_compact_bytes_write / kMB / seconds_up,
+           minor_compact_bytes_read / kGB,
+           minor_compact_bytes_read / kMB / seconds_up,
+           minor_compact_bytes_lsm_write / kGB,
+           minor_compact_bytes_lsm_write / kMB / seconds_up,
+           minor_compact_bytes_rebuild_write / kGB,
+           minor_compact_bytes_rebuild_write / kMB / seconds_up,
+           major_compact_bytes_write / kGB,
+           major_compact_bytes_write / kMB / seconds_up,
+           major_compact_bytes_read / kGB,
+           major_compact_bytes_read / kMB / seconds_up,
+           major_compact_bytes_lsm_write / kGB,
+           major_compact_bytes_lsm_write / kMB / seconds_up,
+           major_compact_bytes_rebuild_write / kGB,
+           major_compact_bytes_rebuild_write / kMB / seconds_up,
+           gc_bytes_write / kGB, gc_bytes_write / kMB / seconds_up,
+           gc_bytes_read / kGB, gc_bytes_read / kMB / seconds_up,
+           gc_bytes_lsm_write / kGB, gc_bytes_lsm_write / kMB / seconds_up,
+           gc_bytes_rebuild_write / kGB,
+           gc_bytes_rebuild_write / kMB / seconds_up);
+  value->append(buf);
+
   // Compaction interval
-  uint64_t interval_compact_bytes_write =
-      compact_bytes_write - cf_stats_snapshot_.compact_bytes_write;
   uint64_t interval_compact_bytes_read =
       compact_bytes_read - cf_stats_snapshot_.compact_bytes_read;
+  uint64_t interval_compact_bytes_write =
+      compact_bytes_write - cf_stats_snapshot_.compact_bytes_write;
+  uint64_t interval_compact_bytes_rebuild_write =
+      compact_bytes_rebuild_write -
+      cf_stats_snapshot_.compact_bytes_rebuild_write;
+  uint64_t interval_compact_bytes_lsm_write =
+      compact_bytes_lsm_write - cf_stats_snapshot_.compact_bytes_lsm_write;
   uint64_t interval_compact_micros =
       compact_micros - cf_stats_snapshot_.compact_micros;
+  uint64_t interval_minor_compact_bytes_read =
+      minor_compact_bytes_read - cf_stats_snapshot_.minor_compact_bytes_read;
+  uint64_t interval_minor_compact_bytes_write =
+      minor_compact_bytes_write - cf_stats_snapshot_.minor_compact_bytes_write;
+  uint64_t interval_minor_compact_bytes_rebuild_write =
+      minor_compact_bytes_rebuild_write -
+      cf_stats_snapshot_.minor_compact_bytes_rebuild_write;
+  uint64_t interval_minor_compact_bytes_lsm_write =
+      minor_compact_bytes_lsm_write -
+      cf_stats_snapshot_.minor_compact_bytes_lsm_write;
+  uint64_t interval_minor_compact_micros =
+      minor_compact_micros - cf_stats_snapshot_.minor_compact_micros;
+  uint64_t interval_major_compact_bytes_read =
+      major_compact_bytes_read - cf_stats_snapshot_.major_compact_bytes_read;
+  uint64_t interval_major_compact_bytes_write =
+      major_compact_bytes_write - cf_stats_snapshot_.major_compact_bytes_write;
+  uint64_t interval_major_compact_bytes_rebuild_write =
+      major_compact_bytes_rebuild_write -
+      cf_stats_snapshot_.major_compact_bytes_rebuild_write;
+  uint64_t interval_major_compact_bytes_lsm_write =
+      major_compact_bytes_lsm_write -
+      cf_stats_snapshot_.major_compact_bytes_lsm_write;
+  uint64_t interval_major_compact_micros =
+      major_compact_micros - cf_stats_snapshot_.major_compact_micros;
+  uint64_t interval_gc_bytes_read =
+      gc_bytes_read - cf_stats_snapshot_.gc_bytes_read;
+  uint64_t interval_gc_bytes_write =
+      gc_bytes_write - cf_stats_snapshot_.gc_bytes_write;
+  uint64_t interval_gc_bytes_rebuild_write =
+      gc_bytes_rebuild_write - cf_stats_snapshot_.gc_bytes_rebuild_write;
+  uint64_t interval_gc_bytes_lsm_write =
+      gc_bytes_lsm_write - cf_stats_snapshot_.gc_bytes_lsm_write;
+  uint64_t interval_gc_micros = gc_micros - cf_stats_snapshot_.gc_micros;
 
   snprintf(
       buf, sizeof(buf),
@@ -1334,9 +1469,80 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
       interval_compact_bytes_read / kMB / std::max(interval_seconds_up, 0.001),
       interval_compact_micros / kMicrosInSec);
   value->append(buf);
-  cf_stats_snapshot_.compact_bytes_write = compact_bytes_write;
+
+  snprintf(
+      buf, sizeof(buf),
+      "Interval cumulative minor compaction: "
+      "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+      "%.2f GB %.2f MB/s minor_compact_bytes_written, "
+      "%.2f GB %.2f MB/s minor_compact_bytes_blob_written\n"
+      "Interval cumulative major compaction: "
+      "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+      "%.2f GB %.2f MB/s major_compact_bytes_written, "
+      "%.2f GB %.2f MB/s major_compact_bytes_blob_written\n"
+      "Interval cumulative gc: "
+      "%.2f GB %.2f MB/s write, %.2f GB %.2f MB/s read, "
+      "%.2f GB %.2f MB/s gc_bytes_written, "
+      "%.2f GB %.2f MB/s gc_bytes_blob_written\n",
+      interval_minor_compact_bytes_write / kGB,
+      interval_minor_compact_bytes_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_minor_compact_bytes_read / kGB,
+      interval_minor_compact_bytes_read / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_minor_compact_bytes_lsm_write / kGB,
+      interval_minor_compact_bytes_lsm_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_minor_compact_bytes_rebuild_write / kGB,
+      interval_minor_compact_bytes_rebuild_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_major_compact_bytes_write / kGB,
+      interval_major_compact_bytes_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_major_compact_bytes_read / kGB,
+      interval_major_compact_bytes_read / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_major_compact_bytes_lsm_write / kGB,
+      interval_major_compact_bytes_lsm_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_major_compact_bytes_rebuild_write / kGB,
+      interval_major_compact_bytes_rebuild_write / kMB /
+          std::max(interval_seconds_up, 0.001),
+      interval_gc_bytes_write / kGB,
+      interval_gc_bytes_write / kMB / std::max(interval_seconds_up, 0.001),
+      interval_gc_bytes_read / kGB,
+      interval_gc_bytes_read / kMB / std::max(interval_seconds_up, 0.001),
+      interval_gc_bytes_lsm_write / kGB,
+      interval_gc_bytes_lsm_write / kMB / std::max(interval_seconds_up, 0.001),
+      interval_gc_bytes_rebuild_write / kGB,
+      interval_gc_bytes_rebuild_write / kMB /
+          std::max(interval_seconds_up, 0.001));
+  value->append(buf);
+
   cf_stats_snapshot_.compact_bytes_read = compact_bytes_read;
+  cf_stats_snapshot_.compact_bytes_write = compact_bytes_write;
+  cf_stats_snapshot_.compact_bytes_rebuild_write = compact_bytes_rebuild_write;
+  cf_stats_snapshot_.compact_bytes_lsm_write = compact_bytes_lsm_write;
   cf_stats_snapshot_.compact_micros = compact_micros;
+  cf_stats_snapshot_.minor_compact_bytes_read = minor_compact_bytes_read;
+  cf_stats_snapshot_.minor_compact_bytes_write = minor_compact_bytes_write;
+  cf_stats_snapshot_.minor_compact_bytes_rebuild_write =
+      minor_compact_bytes_rebuild_write;
+  cf_stats_snapshot_.minor_compact_bytes_lsm_write =
+      minor_compact_bytes_lsm_write;
+  cf_stats_snapshot_.minor_compact_micros = minor_compact_micros;
+  cf_stats_snapshot_.major_compact_bytes_read = major_compact_bytes_read;
+  cf_stats_snapshot_.major_compact_bytes_write = major_compact_bytes_write;
+  cf_stats_snapshot_.major_compact_bytes_rebuild_write =
+      major_compact_bytes_rebuild_write;
+  cf_stats_snapshot_.major_compact_bytes_lsm_write =
+      major_compact_bytes_lsm_write;
+  cf_stats_snapshot_.major_compact_micros = major_compact_micros;
+  cf_stats_snapshot_.gc_bytes_read = gc_bytes_read;
+  cf_stats_snapshot_.gc_bytes_write = gc_bytes_write;
+  cf_stats_snapshot_.gc_bytes_rebuild_write = gc_bytes_rebuild_write;
+  cf_stats_snapshot_.gc_bytes_lsm_write = gc_bytes_lsm_write;
+  cf_stats_snapshot_.gc_micros = gc_micros;
 
   snprintf(buf, sizeof(buf),
            "Stalls(count): %" PRIu64
@@ -1355,6 +1561,8 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
            " memtable_compaction, "
            "%" PRIu64
            " memtable_slowdown, "
+           "%" PRIu64
+           " gc_blob_file_size_stop, "
            "interval %" PRIu64 " total count\n",
            cf_stats_count_[L0_FILE_COUNT_LIMIT_SLOWDOWNS],
            cf_stats_count_[LOCKED_L0_FILE_COUNT_LIMIT_SLOWDOWNS],
@@ -1364,6 +1572,7 @@ void InternalStats::DumpCFStatsNoFileHistogram(std::string* value) {
            cf_stats_count_[PENDING_COMPACTION_BYTES_LIMIT_SLOWDOWNS],
            cf_stats_count_[MEMTABLE_LIMIT_STOPS],
            cf_stats_count_[MEMTABLE_LIMIT_SLOWDOWNS],
+           cf_stats_count_[BLOB_FILE_BYTES_LIMIT_STOPS],
            total_stall_count - cf_stats_snapshot_.stall_count);
   value->append(buf);
 

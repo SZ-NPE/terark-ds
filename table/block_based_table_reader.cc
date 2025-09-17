@@ -48,6 +48,8 @@
 #include "util/string_util.h"
 #include "util/sync_point.h"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 extern const uint64_t kBlockBasedTableMagicNumber;
@@ -121,6 +123,7 @@ void DeleteCachedEntry(const Slice& /*key*/, void* value) {
 
 void DeleteCachedFilterEntry(const Slice& key, void* value);
 void DeleteCachedIndexEntry(const Slice& key, void* value);
+void DeleteIndexKeyBlockEntry(const Slice& key, void* value);
 
 // Release the cached entry and decrement its ref count.
 void ReleaseCachedEntry(void* arg, void* h) {
@@ -147,6 +150,7 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
                                  uint64_t* block_cache_hit_stats,
                                  Statistics* statistics,
                                  GetContext* get_context) {
+  RecordTick(statistics, BLOCK_CACHE_READ);
   auto cache_handle = block_cache->Lookup(key, statistics);
   if (cache_handle != nullptr) {
     PERF_COUNTER_ADD(block_cache_hit_count, 1);
@@ -165,6 +169,16 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
       RecordTick(statistics, BLOCK_CACHE_BYTES_READ,
                  block_cache->GetUsage(cache_handle));
       RecordTick(statistics, block_cache_hit_ticker);
+      if (is_foreground_operation()) {
+        RecordTick(statistics, BLOCK_CACHE_HIT_FG);
+      } else {
+        RecordTick(statistics, BLOCK_CACHE_HIT_BG);
+        if (is_getkey_operation()) {
+          RecordTick(statistics, BLOCK_CACHE_HIT_GET_KEYS);
+        } else {
+          RecordTick(statistics, BLOCK_CACHE_HIT_GC_READ);
+        }
+      }
     }
   } else {
     if (get_context != nullptr) {
@@ -175,6 +189,16 @@ Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
     } else {
       RecordTick(statistics, BLOCK_CACHE_MISS);
       RecordTick(statistics, block_cache_miss_ticker);
+      if (is_foreground_operation()) {
+        RecordTick(statistics, BLOCK_CACHE_MISS_FG);
+      } else {
+        RecordTick(statistics, BLOCK_CACHE_MISS_BG);
+        if (is_getkey_operation()) {
+          RecordTick(statistics, BLOCK_CACHE_MISS_GET_KEYS);
+        } else {
+          RecordTick(statistics, BLOCK_CACHE_MISS_GC_READ);
+        }
+      }
     }
   }
 
@@ -1013,6 +1037,103 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     }
   }
 
+  // insert usage to block_cache
+  Cache::Handle* cache_handle = nullptr;
+  Cache* cache_ = rep->table_options.index_key_cache.get();
+  Slice unique_key_for_index_key_block;
+  const size_t kExtraCacheKeyPrefix = kMaxVarint64Length * 4 + 1;
+  char index_cache_key[kExtraCacheKeyPrefix + 10];
+  size_t len = 0;
+  bool index_in_cache = false;
+
+  Statistics* statistics = rep->ioptions.statistics;
+
+  if (cache_ != nullptr) {
+    memset(index_cache_key, 0, kExtraCacheKeyPrefix + kMaxVarint64Length);
+    memcpy(index_cache_key, rep->cache_key_prefix, rep->cache_key_prefix_size);
+    memcpy(index_cache_key + rep->cache_key_prefix_size, "index_key", 9);
+    len = sizeof(index_cache_key);
+    index_cache_key[len - 1] = '\0';
+    unique_key_for_index_key_block = Slice(index_cache_key, len);
+    cache_handle = cache_->Lookup(unique_key_for_index_key_block);
+    if (cache_handle != nullptr) {
+      index_in_cache = true;
+      cache_->Release(cache_handle);
+      RecordTick(statistics, INDEX_KEY_MAP_CACHE_HIT);
+    } else {
+      RecordTick(statistics, INDEX_KEY_MAP_CACHE_MISS);
+    }
+  }
+
+  // Read the index key meta block
+  bool found_index_key_block;
+  BlockHandle index_key_handle;
+  rep->index_key_handle = std::make_unique<BlockHandle>();
+  s = SeekToIndexKeyBlock(meta_iter.get(), &found_index_key_block,
+                          rep->index_key_handle.get());
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(rep->ioptions.info_log,
+                   "Error when seeking to index key block from file: %s",
+                   s.ToString().c_str());
+  } else if (found_index_key_block && !rep->index_key_handle.get()->IsNull() &&
+             !index_in_cache) {
+    ReadOptions read_options;
+    read_options.fill_cache = false;
+    std::unique_ptr<InternalIteratorBase<Slice>> iter(
+        NewDataBlockIterator<DataBlockIter>(rep, read_options,
+                                            *(rep->index_key_handle)));
+    assert(iter != nullptr);
+    s = iter->status();
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(
+          rep->ioptions.info_log,
+          "Encountered error while reading data from index key block %s",
+          s.ToString().c_str());
+    } else {
+      rep->index_key_map = std::make_unique<StaticMapIndex>(
+          &rep->ioptions.internal_comparator, rep->ioptions.statistics);
+      s = rep->index_key_map->BuildStaticMapIndex(std::move(iter));
+
+      if (cache_ != nullptr) {
+        StaticMapIndex* index_key_map = rep->index_key_map.release();
+        //      Cache::Handle* index_key_cache_handle;
+        //      Status cache_status = block_cache_->Insert(
+        //          unique_key_for_index_key_block, index_key_map,
+        //          index_key_map->Size(), &DeleteIndexKeyBlockEntry,
+        //          &index_key_cache_handle);
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] open and insert to index cache with key "
+                  << index_cache_key << " file no " << rep->file_number
+                  << " with entry size " << index_key_map->Size() / 1024
+                  << std::endl;
+#endif
+        Status cache_status =
+            cache_->Insert(unique_key_for_index_key_block, index_key_map,
+                           index_key_map->Size(), &DeleteIndexKeyBlockEntry,
+                           nullptr, Cache::Priority::HIGH);
+        if (cache_status.IsOKButNoSpace()) {
+          std::unique_ptr<StaticMapIndex> copied_index(
+              new StaticMapIndex(*index_key_map));
+          rep->index_key_map = std::move(copied_index);
+        }
+        if (cache_status.ok()) {
+          cache_->TEST_mark_as_data_block(unique_key_for_index_key_block,
+                                          index_key_map->Size());
+          RecordTick(statistics, INDEX_KEY_MAP_CACHE_ADD);
+          // register cleanup function
+          //        index_key_map->RegisterCleanup(&ReleaseCachedEntry,
+          //        block_cache_, index_key_cache_handle);
+        }
+      }
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(rep->ioptions.info_log,
+                       "Encountered error while building index key map %s",
+                       s.ToString().c_str());
+      }
+    }
+  }
+
   bool need_upper_bound_check =
       PrefixExtractorChanged(rep->table_properties.get(), prefix_extractor);
 
@@ -1094,6 +1215,7 @@ Status BlockBasedTable::Open(const ImmutableCFOptions& ioptions,
     // pre-load these blocks, which will kept in member variables in Rep
     // and with a same life-time as this table object.
     IndexReader* index_reader = nullptr;
+    bts_file_level = level;
     s = new_table->CreateIndexReader(prefetch_buffer.get(), &index_reader,
                                      meta_iter.get(), level);
     if (s.ok()) {
@@ -1775,6 +1897,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
     {
       StopWatch sw(rep->ioptions.env, rep->ioptions.statistics,
                    READ_BLOCK_GET_MICROS);
+      bts_file_level = rep->level;
       s = ReadBlockFromFile(
           rep->file.get(), prefetch_buffer, rep->footer, ro, handle,
           &block_value, rep->ioptions,
@@ -1784,6 +1907,7 @@ TBlockIter* BlockBasedTable::NewDataBlockIterator(
           is_index ? kDisableGlobalSequenceNumber : rep->global_seqno,
           rep->table_options.read_amp_bytes_per_bit,
           GetMemoryAllocator(rep->table_options));
+      bts_file_level = -2;
     }
     if (s.ok()) {
       block.value = block_value.release();
@@ -2176,6 +2300,13 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekForPrev(
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToFirst() {
+  if (gc_accelerate_) {
+    is_out_of_bound_ = false;
+    SavePrevIndexValue();
+    index_iter_->SeekToFirst();
+    assert(index_iter_->Valid());
+    return;
+  }
   is_out_of_bound_ = false;
   SavePrevIndexValue();
   index_iter_->SeekToFirst();
@@ -2204,6 +2335,18 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::SeekToLast() {
 
 template <class TBlockIter, typename TValue>
 void BlockBasedTableIteratorBase<TBlockIter, TValue>::Next() {
+  if (gc_accelerate_) {
+    assert(index_iter_->Valid());
+    index_iter_->Next();
+    // #ifndef NDEBUG
+    //     if (index_iter_->Valid()) {
+    //       fetch_value();
+    //       assert(index_iter_->key().ToString() ==
+    //                       block_iter_.key().ToString());
+    //     }
+    // #endif  // !NDEBUG
+    return;
+  }
   assert(block_iter_points_to_real_block_);
   block_iter_.Next();
   FindKeyForward();
@@ -2332,6 +2475,10 @@ void BlockBasedTableIteratorBase<TBlockIter, TValue>::FindKeyBackward() {
 InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, bool for_compaction) {
+  bool gc_read_optimization =
+      rep_->table_properties_base.meta_type == MetaType::BLOB &&
+      rep_->table_properties_base.blob_single_key_block &&
+      rep_->table_options.blob_single_key_block;
   bool need_upper_bound_check =
       PrefixExtractorChanged(&rep_->table_properties_base, prefix_extractor);
   const bool kIsNotIndex = false;
@@ -2345,7 +2492,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, for_compaction);
+        true /*key_includes_seq*/, true, for_compaction, gc_read_optimization);
   } else {
     auto* mem = arena->AllocateAligned(
         sizeof(BlockBasedTableIterator<DataBlockIter, LazyBuffer>));
@@ -2355,7 +2502,7 @@ InternalIterator* BlockBasedTable::NewIterator(
         !skip_filters && !read_options.total_order_seek &&
             prefix_extractor != nullptr,
         need_upper_bound_check, prefix_extractor, kIsNotIndex,
-        true /*key_includes_seq*/, for_compaction);
+        true /*key_includes_seq*/, true, for_compaction, gc_read_optimization);
   }
 }
 
@@ -2401,6 +2548,162 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
   return may_match;
 }
 
+Status BlockBasedTable::GetKeyFromMap(
+    const ReadOptions& read_options, const Slice& key, GetContext* get_context,
+    const SliceTransform* prefix_extractor,
+    CachableEntry<FilterBlockReader>* filter_entry, bool no_io) {
+  Status s;
+  bool matched = false;  // if such user key matched a key in SST
+  FilterBlockReader* filter = filter_entry->value;
+  StaticMapIndex* index_key_map = nullptr;
+  Cache::Handle* cache_handle = nullptr;
+  Cache* cache_ = rep_->table_options.index_key_cache.get();
+  // First check the full filter
+  // If full filter not useful, Then go into each block
+  Statistics* statistics = rep_->ioptions.statistics;
+  if (!FullFilterKeyMayMatch(read_options, filter, key, no_io,
+                             prefix_extractor)) {
+    RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_USEFUL);
+    PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, 1, rep_->level);
+  } else {
+    // we must get from index_key_map in mem
+    if (cache_ == nullptr || rep_->index_key_map != nullptr) {
+      index_key_map = rep_->index_key_map.get();
+      RecordTick(statistics, INDEX_KEY_MAP_MEM_HIT);
+    } else {
+      // cache != nullptr && rep_->index_key_map == nullptr
+      // build cache key for index key map
+      const size_t kExtraCacheKeyPrefix = kMaxVarint64Length * 4 + 1;
+      char index_cache_key[kExtraCacheKeyPrefix + 10];
+      memset(index_cache_key, 0, kExtraCacheKeyPrefix + kMaxVarint64Length);
+      memcpy(index_cache_key, rep_->cache_key_prefix,
+             rep_->cache_key_prefix_size);
+      memcpy(index_cache_key + rep_->cache_key_prefix_size, "index_key", 9);
+      size_t len = sizeof(index_cache_key);
+      index_cache_key[len - 1] = '\0';
+      Slice unique_key_for_index_key_block = Slice(index_cache_key, len);
+      cache_handle = cache_->Lookup(unique_key_for_index_key_block);
+      // found in cache
+      if (cache_handle != nullptr) {
+        index_key_map =
+            reinterpret_cast<StaticMapIndex*>(cache_->Value(cache_handle));
+        RecordTick(statistics, INDEX_KEY_MAP_CACHE_HIT);
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] Hit in index cache with key " << index_cache_key
+                  << " file no " << rep_->file_number << " with entry size "
+                  << index_key_map->Size() << std::endl;
+#endif
+
+      } else if (!rep_->index_key_handle.get()->IsNull()) {
+        RecordTick(statistics, INDEX_KEY_MAP_CACHE_MISS);
+
+        bool force_load_index_map_to_cache = false;
+        if (force_load_index_map_to_cache) {
+          index_key_map = new StaticMapIndex(
+              &rep_->ioptions.internal_comparator, rep_->ioptions.statistics);
+          ReadOptions read_options;
+          read_options.fill_cache = false;
+          std::unique_ptr<InternalIteratorBase<Slice>> iter(
+              NewDataBlockIterator<DataBlockIter>(rep_, read_options,
+                                                  *(rep_->index_key_handle)));
+          s = index_key_map->BuildStaticMapIndex(std::move(iter));
+#ifndef NDEBUG
+          std::cout << "[tid:" << std::this_thread::get_id()
+                    << "] read and insert to index cache with key "
+                    << index_cache_key << " file no " << rep_->file_number
+                    << " with entry size " << index_key_map->Size()
+                    << std::endl;
+#endif
+          Status cache_status =
+              cache_->Insert(unique_key_for_index_key_block, index_key_map,
+                             index_key_map->Size(), &DeleteIndexKeyBlockEntry,
+                             &cache_handle, Cache::Priority::HIGH);
+          if (cache_status.IsOKButNoSpace()) {
+            std::unique_ptr<StaticMapIndex> copied_index(
+                new StaticMapIndex(*index_key_map));
+            rep_->index_key_map = std::move(copied_index);
+          }
+
+          if (cache_status.ok()) {
+            cache_->TEST_mark_as_data_block(unique_key_for_index_key_block,
+                                            index_key_map->Size());
+            RecordTick(statistics, INDEX_KEY_MAP_CACHE_ADD);
+          }
+        }
+
+        // not found in cache && index_key_handle
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] not found in cache && index_key_handle  " << std::endl;
+#endif
+      }
+    }
+
+    bool is_fg_read = is_foreground_operation();
+    if (index_key_map != nullptr && !index_key_map->empty()) {
+      uint32_t index = index_key_map->GetIndex(key);
+
+      bool found = false;
+      do {
+        if (index >= index_key_map->GetKeyNums()) {
+          break;
+        }
+        Slice queried_key = index_key_map->GetKey(index);
+        if (index_key_map->CompareKey(key, queried_key)) {
+          break;
+        }
+
+        ParsedInternalKey parsed_key;
+        if (!ParseInternalKey(queried_key, &parsed_key)) {
+          s = Status::Corruption(Slice());
+          break;
+        }
+        if (is_fg_read) {
+          parsed_key.type = kTypeValueIndex;
+        }
+        static LazyBufferStateImpl static_state;
+        get_context->SaveValue(
+            parsed_key,
+            LazyBuffer(&static_state, {}, index_key_map->GetValue(index),
+                       rep_->file_number),
+            &matched);
+        found = true;
+        break;
+      } while (-1);
+
+      if (is_fg_read && !found) {
+        s = Status::NotFound("not found in index key map for fg read");
+      }
+    } else {
+      // no index map
+      if (is_fg_read) {
+        s = Status::NotFound("not found in index key map for fg read");
+      } else {
+        s = Status::NotFound("not found in index key map for gc lookup");
+      }
+    }
+
+    if (matched && filter != nullptr && !filter->IsBlockBased()) {
+      RecordTick(rep_->ioptions.statistics, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+      PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
+                                rep_->level);
+    }
+  }
+
+  // if rep_->filter_entry is not set, we should call Release(); otherwise
+  // don't call, in this case we have a local copy in rep_->filter_entry,
+  // it's pinned to the cache and will be released in the destructor
+  if (!rep_->filter_entry.IsSet()) {
+    filter_entry->Release(rep_->table_options.block_cache.get());
+  }
+
+  if (cache_handle != nullptr && cache_ != nullptr) {
+    cache_->Release(cache_handle);
+  }
+  return s;
+}
+
 Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
                             GetContext* get_context,
                             const SliceTransform* prefix_extractor,
@@ -2414,6 +2717,28 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         GetFilter(prefix_extractor, /*prefetch_buffer*/ nullptr,
                   read_options.read_tier == kBlockCacheTier, get_context);
   }
+
+  // When use_index_key_block == true and the operation is getkey in
+  // garbage collection, get key from index_key_map
+  bool is_gc_lookup = get_context->is_getkey();
+  bool enable_fg_read_acc = true;
+  bool accelerate_fg_read =
+      enable_fg_read_acc && is_foreground_operation() && rep_->level != -1;
+
+  if (rep_->table_properties_base.use_index_key_block == true &&
+      rep_->table_options.use_index_key_block &&
+      (rep_->index_key_map != nullptr ||
+       rep_->table_options.index_key_cache != nullptr) &&
+      (is_gc_lookup || accelerate_fg_read)) {
+    s = GetKeyFromMap(read_options, key, get_context, prefix_extractor,
+                      &filter_entry, no_io);
+    RecordTick(rep_->ioptions.statistics, GC_INDEX_KEY_MAP_READ_COUNT);
+
+    if ((is_gc_lookup && s.ok()) || s.ok()) {
+      return s;
+    }
+  }
+
   FilterBlockReader* filter = filter_entry.value;
 
   // First check the full filter
@@ -3264,6 +3589,16 @@ void DeleteCachedIndexEntry(const Slice& /*key*/, void* value) {
                index_reader->ApproximateMemoryUsage());
   }
   delete index_reader;
+}
+
+void DeleteIndexKeyBlockEntry(const Slice& key, void* value) {
+#ifndef NDEBUG
+  std::cout << "[tid:" << std::this_thread::get_id()
+            << "] delete entry in index cache with key " << key.ToString()
+            << std::endl;
+#endif
+  StaticMapIndex* map_index = reinterpret_cast<StaticMapIndex*>(value);
+  delete map_index;
 }
 
 }  // anonymous namespace

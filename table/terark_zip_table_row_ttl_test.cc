@@ -31,7 +31,7 @@ class TestEnv : public EnvWrapper {
         CloseHelper();
       }
     }
-    virtual void Logv(const char* /*format*/, va_list /*ap*/) override{};
+    virtual void Logv(const char* /*format*/, va_list /*ap*/) override {};
 
    protected:
     virtual Status CloseImpl() override { return CloseHelper(); }
@@ -100,11 +100,11 @@ TEST_F(TerarkZipTableBuilderTest, FunctionTest) {
   std::string column_family_name;
   int unknown_level = -1;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
-                          CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name,
-                          unknown_level, 0 /* compaction_load */),
+      TableBuilderOptions(
+          ioptions, moptions, ikc, &int_tbl_prop_collector_factories,
+          kNoCompression, CompressionOptions(), nullptr /* compression_dict */,
+          false /* skip_filters */, 0 /* meta_type */, column_family_name,
+          unknown_level, 0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
   for (char c = 'a'; c <= 'z'; ++c) {
@@ -184,11 +184,11 @@ TEST_P(TerarkZipTableBuilderTest, BoundaryTest) {
   std::string column_family_name;
   int unknown_level = -1;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
-                          CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name,
-                          unknown_level, 0 /* compaction_load */),
+      TableBuilderOptions(
+          ioptions, moptions, ikc, &int_tbl_prop_collector_factories,
+          kNoCompression, CompressionOptions(), nullptr /* compression_dict */,
+          false /* skip_filters */, 0 /* meta_type */, column_family_name,
+          unknown_level, 0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
   uint64_t nowseconds = env->NowMicros() / 1000000ul;

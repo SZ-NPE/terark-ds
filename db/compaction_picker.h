@@ -109,6 +109,7 @@ class CompactionPicker {
   // Pick compaction which level has map or link sst
   Compaction* PickGarbageCollection(const std::string& cf_name,
                                     const MutableCFOptions& mutable_cf_options,
+                                    double dynamic_blob_gc_ratio,
                                     VersionStorageInfo* vstorage,
                                     LogBuffer* log_buffer);
 

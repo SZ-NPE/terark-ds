@@ -120,6 +120,11 @@ class Status {
   // Return a success status.
   static Status OK() { return Status(); }
 
+  static Status OKWithCacheNoSpace() {
+    return Status(kOk, kNoSpace);
+  }
+
+
   // Return error status of an appropriate type.
   static Status NotFound(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kNotFound, msg, msg2);
@@ -313,6 +318,10 @@ class Status {
   // if needed
   bool IsNoSpace() const {
     return (code() == kIOError) && (subcode() == kNoSpace);
+  }
+
+  bool IsOKButNoSpace() const {
+    return (code() == kOk) && (subcode() == kNoSpace);
   }
 
   // Returns true iff the status indicates a memory limit error.  There may be

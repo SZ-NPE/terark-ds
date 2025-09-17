@@ -41,6 +41,8 @@ uint8_t reverse_byte(uint8_t v) {
 
 namespace TERARKDB_NAMESPACE {
 
+const uint64_t kInvalidFileNumber = std::numeric_limits<uint64_t>::max();
+
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed.
 enum Tag : uint32_t {

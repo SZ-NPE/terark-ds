@@ -29,4 +29,7 @@ Status SeekToCompressionDictBlock(InternalIteratorBase<Slice>* meta_iter,
 Status SeekToRangeDelBlock(InternalIteratorBase<Slice>* meta_iter,
                            bool* is_found, BlockHandle* block_handle);
 
+Status SeekToIndexKeyBlock(InternalIteratorBase<Slice>* meta_iter,
+                           bool* is_found, BlockHandle* block_handle);
+
 }  // namespace TERARKDB_NAMESPACE

@@ -26,6 +26,8 @@
 #include "util/arena.h"
 #include "util/coding.h"
 #include "util/logging.h"
+#include "rocksdb/perf_context.h"
+
 
 namespace TERARKDB_NAMESPACE {
 
@@ -187,6 +189,7 @@ class InternalKeyComparator
 
   int Compare(const InternalKey& a, const InternalKey& b) const;
   int Compare(const ParsedInternalKey& a, const ParsedInternalKey& b) const;
+  int CompareUserKey(const Slice& a, const Slice& b) const;
   virtual const Comparator* GetRootComparator() const override {
     return user_comparator_->GetRootComparator();
   }
@@ -263,6 +266,18 @@ class InternalKey {
 inline int InternalKeyComparator::Compare(const InternalKey& a,
                                           const InternalKey& b) const {
   return Compare(a.Encode(), b.Encode());
+}
+
+inline int InternalKeyComparator::CompareUserKey(const Slice& a,
+                                                 const Slice& b) const {
+  int r = 0;
+  if (is_foreground_operation()) {
+    r = user_comparator_->Compare(ExtractUserKey(a), ExtractUserKey(b));
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
+  } else {
+    return Compare(a, b);
+  }
+  return r;
 }
 
 inline bool ParseInternalKey(const Slice& internal_key,
@@ -807,6 +822,17 @@ class SeparateHelper {
     assert(slice.size() >= sizeof(uint64_t));
     return Slice(slice.data() + sizeof(uint64_t),
                  slice.size() - sizeof(uint64_t));
+  }
+
+  static uint32_t DecodeValueSize(const Slice& slice) {
+    assert(slice.size() >= sizeof(uint32_t));
+    uint32_t value_size;
+    memcpy(&value_size, slice.data() + slice.size() - sizeof(uint32_t),
+           sizeof(uint32_t));
+    if (!port::kLittleEndian) {
+      value_size = EndianTransform(value_size, sizeof value_size);
+    }
+    return value_size;
   }
 
   static Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,

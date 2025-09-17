@@ -228,14 +228,14 @@ Status DBImpl::FlushMemTableToOutputFile(
     autovector<ColumnFamilyData*> cfds = {cfd};
     FlushRequestVec flush_req_vec;
     // Let's re-schedule this cfd for flush
-    WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
+    // WriteThread::Writer w;
+    // write_thread_.EnterUnbatched(&w, &mutex_);
     ProcessAtomicFlushGroup(&cfds, &flush_req_vec);
     assert(cfds.size() == 1);
     assert(flush_req_vec.size() == 1 && flush_req_vec.front().size() == 1);
     PrepareFlushReqVec(flush_req_vec, true /* force_flush */);
     SchedulePendingFlush(flush_req_vec, FlushReason::kInstallTimeout);
-    write_thread_.ExitUnbatched(&w);
+    // write_thread_.ExitUnbatched(&w);
   }
   return s;
 }
@@ -1723,6 +1723,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               vstorage->l0_delay_trigger_count() + 1,
               int(vstorage->read_amplification()) + 1,
               vstorage->estimated_compaction_needed_bytes(),
+              vstorage->total_db_file_size(), vstorage->total_garbage_ratio(),
               cfd->ioptions()->num_levels, mutable_cf_options)
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
@@ -2054,17 +2055,25 @@ void DBImpl::SchedulePendingPurge(const std::string& fname,
 }
 
 void DBImpl::BGWorkFlush(void* db) {
+  DBOperationTypeGuard op_guard(kOpTypeFlush);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::HIGH);
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Flush";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   reinterpret_cast<DBImpl*>(db)->BackgroundCallFlush();
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
 }
 
 void DBImpl::BGWorkCompaction(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeCompaction);
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
   TEST_SYNC_POINT("DBImpl::BGWorkCompaction");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Compaction";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   auto prepicked_compaction =
       static_cast<PrepickedCompaction*>(ca.prepicked_compaction);
   reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallCompaction(
@@ -2073,14 +2082,19 @@ void DBImpl::BGWorkCompaction(void* arg) {
 }
 
 void DBImpl::BGWorkGarbageCollection(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeGC);
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::LOW);
   TEST_SYNC_POINT("DBImpl::BGWorkGarbageCollection");
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:GC";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallGarbageCollection();
 }
 
 void DBImpl::BGWorkBottomCompaction(void* arg) {
+  DBOperationTypeGuard op_guard(kOpTypeCompaction);
   CompactionArg ca = *(static_cast<CompactionArg*>(arg));
   delete static_cast<CompactionArg*>(arg);
   IOSTATS_SET_THREAD_POOL_ID(Env::Priority::BOTTOM);
@@ -2088,6 +2102,9 @@ void DBImpl::BGWorkBottomCompaction(void* arg) {
   auto* prepicked_compaction = ca.prepicked_compaction;
   assert(prepicked_compaction && prepicked_compaction->compaction &&
          !prepicked_compaction->manual_compaction_state);
+  // Set the thread name to aid debugging
+  std::string thread_name = "Tag:Bottom";
+  pthread_setname_np(pthread_self(), thread_name.c_str());
   ca.db->BackgroundCallCompaction(prepicked_compaction, Env::Priority::BOTTOM);
   delete prepicked_compaction;
 }

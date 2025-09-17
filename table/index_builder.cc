@@ -28,13 +28,14 @@ IndexBuilder* IndexBuilder::CreateIndexBuilder(
     const InternalKeyComparator* comparator,
     const InternalKeySliceTransform* int_key_slice_transform,
     const bool use_value_delta_encoding,
-    const BlockBasedTableOptions& table_opt) {
+    const BlockBasedTableOptions& table_opt, MetaType type) {
   IndexBuilder* result = nullptr;
   switch (index_type) {
     case BlockBasedTableOptions::kBinarySearch: {
       result = new ShortenedIndexBuilder(
           comparator, table_opt.index_block_restart_interval,
-          table_opt.format_version, use_value_delta_encoding);
+          table_opt.format_version, use_value_delta_encoding,
+          type == MetaType::BLOB && table_opt.blob_single_key_block);
     } break;
     case BlockBasedTableOptions::kHashSearch: {
       result = new HashIndexBuilder(comparator, int_key_slice_transform,
@@ -91,7 +92,7 @@ void PartitionedIndexBuilder::MakeNewSubIndexBuilder() {
   assert(sub_index_builder_ == nullptr);
   sub_index_builder_ = new ShortenedIndexBuilder(
       comparator_, table_opt_.index_block_restart_interval,
-      table_opt_.format_version, use_value_delta_encoding_);
+      table_opt_.format_version, use_value_delta_encoding_, false);
   flush_policy_.reset(FlushBlockBySizePolicyFactory::NewFlushBlockPolicy(
       table_opt_.metadata_block_size, table_opt_.block_size_deviation,
       // Note: this is sub-optimal since sub_index_builder_ could later reset

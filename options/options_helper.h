@@ -64,6 +64,7 @@ enum class OptionType {
   kTableFactory,
   kComparator,
   kCompactionFilter,
+  kDropCache,
   kCompactionFilterFactory,
   kCompactionOptionsUniversal,
   kCompactionStopStyle,

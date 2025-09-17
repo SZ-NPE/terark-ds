@@ -62,6 +62,10 @@ struct TablePropertiesNames {
   static const std::string kCompression;
   static const std::string kCreationTime;
   static const std::string kOldestKeyTime;
+  static const std::string kSeparatedEntryCount;
+  static const std::string kUseIndexKeyBlock;
+  static const std::string kSSTMetaType;
+  static const std::string kBlobSingleKeyBlock;
   static const std::string kSnapshots;
   static const std::string kPurpose;
   static const std::string kReadAmp;
@@ -76,6 +80,7 @@ struct TablePropertiesNames {
 extern const std::string kPropertiesBlock;
 extern const std::string kCompressionDictBlock;
 extern const std::string kRangeDelBlock;
+extern const std::string kIndexKeyBlock;
 
 // `TablePropertiesCollector` provides the mechanism for users to collect
 // their own properties that they are interested in. This class is essentially
@@ -201,6 +206,21 @@ struct TablePropertiesBase {
   uint64_t creation_time = 0;
   // Timestamp of the earliest key. 0 means unknown.
   uint64_t oldest_key_time = 0;
+  // Use this to accelerate garbage collection reading
+  uint64_t index_key_is_full_internal_key = 0;
+  // 0 is the default key sst in LSM-tree
+  // 1 is the value sst (blob)
+  uint64_t meta_type = 0;
+
+  uint64_t separated_entry_count = 0;
+
+  // 0 is the default the version not support gc read accelerate
+  // 1 is the version that support gc read accelerate
+  uint64_t blob_single_key_block = 0;
+  
+  // 0 is the default the version not support the validity check accelerate
+  // 1 is the version that support validity check accelerate
+  uint64_t use_index_key_block = 0;
 
   // Name of the column family with which this SST file is associated.
   // If column family is unknown, `column_family_name` will be an empty string.

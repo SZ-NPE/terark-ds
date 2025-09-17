@@ -77,6 +77,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                          size_t batch_cnt,
                          PreReleaseCallback* pre_release_callback) {
   LatencyHistLoggedGuard guard(&write_latency_reporter_, 500000);
+  DBOperationTypeGuard op_guard(kOpTypeFG);
   write_qps_reporter_.AddCount(WriteBatchInternal::Count(my_batch));
   write_throughput_reporter_.AddCount(WriteBatchInternal::ByteSize(my_batch));
   write_batch_size_reporter_.AddRecord(WriteBatchInternal::ByteSize(my_batch));
@@ -134,6 +135,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   }
 
   StopWatch write_sw(env_, immutable_db_options_.statistics.get(), DB_WRITE);
+  // DBOperationTypeGuard op_guard(kOpTypeFG);
 
   write_thread_.JoinBatchGroup(&w);
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {

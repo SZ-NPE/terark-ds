@@ -737,7 +737,7 @@ std::vector<RangeWithDepend> PartitionRangeWithDepend(
     const InternalKeyComparator& icomp, PartitionType type) {
   std::vector<RangeWithDepend> output;
   assert(!ranges_a.empty() && !ranges_b.empty());
-  const RangeWithDepend* source;
+  const RangeWithDepend* source = nullptr;
   auto put_left = [&](const Slice& key, bool include,
                       const RangeWithDepend* r) {
     assert(output.empty() || icomp.Compare(output.back().point[1], key) < 0 ||

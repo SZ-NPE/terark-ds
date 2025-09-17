@@ -43,6 +43,16 @@ struct ImmutableCFOptions {
 
   const CompactionFilter* compaction_filter;
 
+  std::shared_ptr<Cache> drop_key_cache;
+
+  bool hotness_aware;
+
+  bool score_modify = true;
+
+  bool score_modify_advanced = true;
+
+  bool compensated_size_optimize = true;
+
   CompactionFilterFactory* compaction_filter_factory;
 
   CompactionDispatcher* compaction_dispatcher;
@@ -173,6 +183,9 @@ struct MutableCFOptions {
         target_file_size_multiplier(0),
         max_bytes_for_level_base(0),
         max_bytes_for_level_multiplier(0),
+        garbage_ratio_stop_writes_trigger(0),
+        blob_file_bytes_limit(0),
+        gc_adpative_readahead(false),
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
         report_bg_io_stats(false),
@@ -236,6 +249,11 @@ struct MutableCFOptions {
   double max_bytes_for_level_multiplier;
   std::vector<int> max_bytes_for_level_multiplier_additional;
   CompactionOptionsUniversal compaction_options_universal;
+
+  // GC related options
+  double garbage_ratio_stop_writes_trigger;
+  uint64_t blob_file_bytes_limit;
+  bool gc_adpative_readahead;
 
   // Misc options
   uint64_t max_sequential_skip_in_iterations;

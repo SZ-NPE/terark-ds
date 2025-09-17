@@ -139,7 +139,8 @@ TEST_F(HistogramTest, HistogramWindowingExpire) {
   ASSERT_EQ(histogramWindowing.num(), 100);
   ASSERT_EQ(histogramWindowing.min(), 1);
   ASSERT_EQ(histogramWindowing.max(), 1);
-  ASSERT_EQ(histogramWindowing.Average(), 1);
+  ASSERT_EQ(histogramWindowing.Average(), 1.0);
+  ASSERT_EQ(histogramWindowing.StandardDeviation(), 0.0);
 
   PopulateHistogram(histogramWindowing, 2, 2, 100);
   env->SleepForMicroseconds(micros_per_window);
@@ -147,6 +148,7 @@ TEST_F(HistogramTest, HistogramWindowingExpire) {
   ASSERT_EQ(histogramWindowing.min(), 1);
   ASSERT_EQ(histogramWindowing.max(), 2);
   ASSERT_EQ(histogramWindowing.Average(), 1.5);
+  ASSERT_GT(histogramWindowing.StandardDeviation(), 0.0);
 
   PopulateHistogram(histogramWindowing, 3, 3, 100);
   env->SleepForMicroseconds(micros_per_window);
@@ -154,6 +156,7 @@ TEST_F(HistogramTest, HistogramWindowingExpire) {
   ASSERT_EQ(histogramWindowing.min(), 1);
   ASSERT_EQ(histogramWindowing.max(), 3);
   ASSERT_EQ(histogramWindowing.Average(), 2.0);
+  ASSERT_GT(histogramWindowing.StandardDeviation(), 0.0);
 
   // dropping oldest window with value 1, remaining 2 ~ 4
   PopulateHistogram(histogramWindowing, 4, 4, 100);
@@ -162,6 +165,7 @@ TEST_F(HistogramTest, HistogramWindowingExpire) {
   ASSERT_EQ(histogramWindowing.min(), 2);
   ASSERT_EQ(histogramWindowing.max(), 4);
   ASSERT_EQ(histogramWindowing.Average(), 3.0);
+  ASSERT_GT(histogramWindowing.StandardDeviation(), 0.0);
 
   // dropping oldest window with value 2, remaining 3 ~ 5
   PopulateHistogram(histogramWindowing, 5, 5, 100);
@@ -170,6 +174,7 @@ TEST_F(HistogramTest, HistogramWindowingExpire) {
   ASSERT_EQ(histogramWindowing.min(), 3);
   ASSERT_EQ(histogramWindowing.max(), 5);
   ASSERT_EQ(histogramWindowing.Average(), 4.0);
+  ASSERT_GT(histogramWindowing.StandardDeviation(), 0.0);
 }
 
 TEST_F(HistogramTest, HistogramWindowingMerge) {

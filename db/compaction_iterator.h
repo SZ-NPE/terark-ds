@@ -73,6 +73,8 @@ class CompactionIterator {
                      const SnapshotChecker* snapshot_checker, Env* env,
                      bool report_detailed_time, bool expect_valid_internal_key,
                      CompactionRangeDelAggregator* range_del_agg,
+                     std::shared_ptr<Cache> drop_key_cache = nullptr,
+                     bool hotness_aware = false,
                      const Compaction* compaction = nullptr,
                      BlobConfig blob_config = BlobConfig{size_t(-1), 0.0},
                      const CompactionFilter* compaction_filter = nullptr,
@@ -89,6 +91,7 @@ class CompactionIterator {
                      const SnapshotChecker* snapshot_checker, Env* env,
                      bool report_detailed_time, bool expect_valid_internal_key,
                      CompactionRangeDelAggregator* range_del_agg,
+                     std::shared_ptr<Cache> drop_key_cache, bool hotness_aware,
                      std::unique_ptr<CompactionProxy> compaction,
                      BlobConfig blob_config,
                      const CompactionFilter* compaction_filter = nullptr,
@@ -228,6 +231,9 @@ class CompactionIterator {
   size_t filter_sample_interval_ = 64;
   size_t filter_hit_count_ = 0;
   const chash_set<uint64_t>* rebuild_blob_set_;
+
+  std::shared_ptr<Cache> drop_key_cache_;
+  bool hotness_aware_;
 
  public:
   bool IsShuttingDown() {

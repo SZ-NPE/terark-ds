@@ -161,6 +161,7 @@ struct CompactionWorkerContext {
   std::vector<std::pair<int, uint64_t>> inputs;
   std::string cf_name;
   uint64_t target_file_size;
+  uint64_t meta_type;
   CompressionType compression;
   CompressionOptions compression_opts;
   std::vector<SequenceNumber> existing_snapshots;

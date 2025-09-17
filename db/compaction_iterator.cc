@@ -113,8 +113,10 @@ CompactionIterator::CompactionIterator(
     SequenceNumber earliest_write_conflict_snapshot,
     const SnapshotChecker* snapshot_checker, Env* env,
     bool report_detailed_time, bool expect_valid_internal_key,
-    CompactionRangeDelAggregator* range_del_agg, const Compaction* compaction,
-    BlobConfig blob_config, const CompactionFilter* compaction_filter,
+    CompactionRangeDelAggregator* range_del_agg,
+    std::shared_ptr<Cache> drop_key_cache, bool hotness_aware,
+    const Compaction* compaction, BlobConfig blob_config,
+    const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const SequenceNumber preserve_deletes_seqnum,
     const chash_set<uint64_t>* need_rebuild_blobs)
@@ -122,6 +124,7 @@ CompactionIterator::CompactionIterator(
           input, separate_helper, end, cmp, merge_helper, last_sequence,
           snapshots, earliest_write_conflict_snapshot, snapshot_checker, env,
           report_detailed_time, expect_valid_internal_key, range_del_agg,
+          drop_key_cache, hotness_aware,
           std::unique_ptr<CompactionProxy>(
               compaction ? new CompactionProxy(compaction) : nullptr),
           blob_config, compaction_filter, shutting_down,
@@ -135,6 +138,7 @@ CompactionIterator::CompactionIterator(
     const SnapshotChecker* snapshot_checker, Env* env,
     bool /*report_detailed_time*/, bool expect_valid_internal_key,
     CompactionRangeDelAggregator* range_del_agg,
+    std::shared_ptr<Cache> drop_key_cache, bool hotness_aware,
     std::unique_ptr<CompactionProxy> compaction, BlobConfig blob_config,
     const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
@@ -162,7 +166,9 @@ CompactionIterator::CompactionIterator(
       current_user_key_snapshot_(0),
       merge_out_iter_(merge_helper_),
       current_key_committed_(false),
-      rebuild_blob_set_(need_rebuild_blobs) {
+      rebuild_blob_set_(need_rebuild_blobs),
+      drop_key_cache_(drop_key_cache),
+      hotness_aware_(hotness_aware) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
       compaction_ == nullptr ? false : compaction_->bottommost_level();
@@ -311,6 +317,17 @@ void CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
     if (filter == CompactionFilter::Decision::kRemove) {
       // convert the current key to a delete; key_ is pointing into
       // current_key_ at this point, so updating current_key_ updates key()
+      // Hotness awareness: collect keys deleted by CompactionFilter
+      if (hotness_aware_ && drop_key_cache_ != nullptr && ikey_.type == ValueType::kTypeValueIndex) {
+        Slice logical_key = ikey_.user_key;
+        auto ret = drop_key_cache_->Lookup(logical_key);
+        if (ret == nullptr) {
+          drop_key_cache_->Insert(logical_key, nullptr, 1, nullptr);
+        } else {
+          drop_key_cache_->Release(ret);
+        }
+      }
+
       ikey_.type = kTypeDeletion;
       current_key_.UpdateInternalKey(ikey_.sequence, kTypeDeletion);
       // no value associated with delete
@@ -411,6 +428,15 @@ void CompactionIterator::NextFromInput() {
       // TODO(rven): Compaction filter does not process keys in this path
       // Need to have the compaction filter process multiple versions
       // if we have versions on both sides of a snapshot
+      // Collect drop keys during compaction, insert them to cache
+      if (hotness_aware_ && drop_key_cache_ != nullptr && ikey_.type == ValueType::kTypeValueIndex) {
+        Slice logical_key = ikey_.user_key;
+        auto ret = drop_key_cache_->Lookup(logical_key);
+        if (ret == nullptr) {
+          drop_key_cache_->Insert(logical_key, nullptr, 1, nullptr);
+        }
+      }
+
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       key_ = current_key_.GetInternalKey();
       value_ = input_.value(current_key_.GetUserKey(), &value_meta_);

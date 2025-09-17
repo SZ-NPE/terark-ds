@@ -277,7 +277,7 @@ class TableConstructor : public Constructor {
                             &int_tbl_prop_collector_factories,
                             options.compression, CompressionOptions(),
                             nullptr /* compression_dict */,
-                            false /* skip_filters */, column_family_name,
+                            false /* skip_filters */, 0, column_family_name,
                             level_, 0 /* compaction_load */),
         TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
         file_writer_.get()));
@@ -2582,7 +2582,7 @@ TEST_F(PlainTableTest, BasicPlainTableProperties) {
       TableBuilderOptions(ioptions, moptions, ikc,
                           &int_tbl_prop_collector_factories, kNoCompression,
                           CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name,
+                          false /* skip_filters */, 0, column_family_name,
                           unknown_level, 0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
@@ -3222,7 +3222,7 @@ TEST_P(BlockBasedTableTest, BlockAlignTest) {
       TableBuilderOptions(ioptions, moptions, ikc,
                           &int_tbl_prop_collector_factories, kNoCompression,
                           CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name, -1,
+                          false /* skip_filters */, 0, column_family_name, -1,
                           0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));
@@ -3316,7 +3316,7 @@ TEST_P(BlockBasedTableTest, PropertiesBlockRestartPointTest) {
       TableBuilderOptions(ioptions, moptions, ikc,
                           &int_tbl_prop_collector_factories, kNoCompression,
                           CompressionOptions(), nullptr /* compression_dict */,
-                          false /* skip_filters */, column_family_name, -1,
+                          false /* skip_filters */, 0, column_family_name, -1,
                           0 /* compaction_load */),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       file_writer.get()));

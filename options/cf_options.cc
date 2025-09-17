@@ -37,6 +37,11 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
           cf_options.value_meta_extractor_factory.get()),
       ttl_extractor_factory(cf_options.ttl_extractor_factory.get()),
       compaction_filter(cf_options.compaction_filter),
+      drop_key_cache(cf_options.drop_key_cache),
+      hotness_aware(cf_options.hotness_aware),
+      score_modify(cf_options.score_modify),
+      score_modify_advanced(cf_options.score_modify_advanced),
+      compensated_size_optimize(cf_options.compensated_size_optimize),
       compaction_filter_factory(cf_options.compaction_filter_factory.get()),
       compaction_dispatcher(cf_options.compaction_dispatcher.get()),
       min_write_buffer_number_to_merge(
@@ -228,6 +233,12 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_bytes_for_level_base);
   ROCKS_LOG_INFO(log, "           max_bytes_for_level_multiplier: %f",
                  max_bytes_for_level_multiplier);
+  ROCKS_LOG_INFO(log, "        garbage_ratio_stop_writes_trigger: %f",
+                 garbage_ratio_stop_writes_trigger);
+  ROCKS_LOG_INFO(log, "                    blob_file_bytes_limit: %" PRIu64,
+                 blob_file_bytes_limit);
+  ROCKS_LOG_INFO(log, "                    gc_adpative_readahead: %d",
+                 gc_adpative_readahead);
   ROCKS_LOG_INFO(log, "                             ttl_gc_ratio: %f",
                  ttl_gc_ratio);
   ROCKS_LOG_INFO(log, "                         ttl_max_scan_gap: %zd",
@@ -315,6 +326,10 @@ MutableCFOptions::MutableCFOptions(const ColumnFamilyOptions& options, Env* env)
       max_bytes_for_level_multiplier_additional(
           options.max_bytes_for_level_multiplier_additional),
       compaction_options_universal(options.compaction_options_universal),
+      garbage_ratio_stop_writes_trigger(
+          options.garbage_ratio_stop_writes_trigger),
+      blob_file_bytes_limit(options.blob_file_bytes_limit),
+      gc_adpative_readahead(options.gc_adpative_readahead),
       max_sequential_skip_in_iterations(
           options.max_sequential_skip_in_iterations),
       paranoid_file_checks(options.paranoid_file_checks),

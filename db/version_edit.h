@@ -26,6 +26,7 @@ namespace TERARKDB_NAMESPACE {
 class VersionSet;
 
 const uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
+extern const uint64_t kInvalidFileNumber;
 
 extern uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 
@@ -233,6 +234,8 @@ struct FileMetaData {
     return gc_status == kGarbageCollectionPermitted;
   }
   void set_gc_candidate() { gc_status = kGarbageCollectionCandidate; }
+
+  uint64_t raw_size() const { return prop.raw_key_size + prop.raw_value_size; }
 };
 
 // A compressed copy of file meta data that just contain minimum data needed

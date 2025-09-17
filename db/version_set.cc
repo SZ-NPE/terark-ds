@@ -57,6 +57,8 @@
 #include "util/sync_point.h"
 #include "utilities/util/valvec.hpp"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 namespace {
@@ -379,7 +381,7 @@ struct MarkedFilesComp {
 
 }  // anonymous namespace
 
-VersionStorageInfo::~VersionStorageInfo() { delete[](files_ - 1); }
+VersionStorageInfo::~VersionStorageInfo() { delete[] (files_ - 1); }
 
 Version::~Version() {
   assert(refs_ == 0);
@@ -794,10 +796,10 @@ Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
   // pass the magic number check in the footer.
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(
-          std::move(file), file_name, nullptr /* env */, nullptr /* stats */,
-          0 /* hist_type */, nullptr /* file_read_hist */,
-          nullptr /* rate_limiter */, false /* for_compaction*/,
-          ioptions->listeners));
+          std::move(file), file_name, env_ /* env */,
+          ioptions->statistics /* stats */, 0 /* hist_type */,
+          nullptr /* file_read_hist */, nullptr /* rate_limiter */,
+          false /* for_compaction*/, ioptions->listeners));
   s = ReadTableProperties(
       file_reader.get(), file_meta->fd.GetFileSize(),
       Footer::kInvalidTableMagicNumber /* table's magic number */, *ioptions,
@@ -831,8 +833,10 @@ Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props,
                       file_meta->fd.GetPathId());
     // 1. If the table is already present in table cache, load table
     // properties from there.
+    bts_file_level = level;
     std::shared_ptr<const TableProperties> table_properties;
     Status s = GetTableProperties(&table_properties, file_meta, &fname);
+    bts_file_level = -2;
     if (s.ok()) {
       props->insert({fname, table_properties});
     } else {
@@ -1459,11 +1463,13 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
                      ValueType* type, SequenceNumber* seq, LazyBuffer* value,
                      const FileMetaData& blob) {
   RecordTick(db_statistics_, GC_GET_KEYS);
+  // StopWatch sw(env_, db_statistics_, GC_GET_KEY_TIME);
+  BGOperationTypeGuard::SetOperationType(kOpTypeGetKey);
   bool value_found;
   GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
                          cfd_->ioptions()->info_log, db_statistics_,
                          GetContext::kNotFound, user_key, value, &value_found,
-                         nullptr, nullptr, nullptr, env_, seq);
+                         nullptr, nullptr, nullptr, env_, seq, nullptr, true);
   ReadOptions options;
 
   FilePicker fp(
@@ -1480,6 +1486,13 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
     if (!status->ok()) {
       return;
     }
+    // //*************************************************************
+    // if (get_context.State() != GetContext::kNotFound &&
+    //     get_context.State() != GetContext::kMerge &&
+    //     db_statistics_ != nullptr) {
+    //   get_context.ReportCounters();
+    // }
+    // //*************************************************************
     switch (get_context.State()) {
       case GetContext::kNotFound:
         break;
@@ -1498,7 +1511,13 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
     }
     f = fp.GetNextFile();
   }
+  // //**********************************************************
+  // if (db_statistics_ != nullptr) {
+  //   get_context.ReportCounters();
+  // }
+  // //**********************************************************
   *status = Status::NotFound();
+  BGOperationTypeGuard::ResetOperationType();
 }
 
 bool Version::IsFilterSkipped(int level, bool is_file_last_in_level) {
@@ -1791,7 +1810,11 @@ void VersionStorageInfo::ComputeCompactionScore(
       uint64_t total_size = 0;
       for (auto* f : files_[level]) {
         if (!f->being_compacted) {
-          total_size += f->compensated_file_size;
+          if (immutable_cf_options.compensated_size_optimize) {
+            total_size += f->compensated_file_size;
+          } else {
+            total_size += f->fd.GetFileSize();
+          }
           num_sorted_runs++;
         }
       }
@@ -1812,16 +1835,38 @@ void VersionStorageInfo::ComputeCompactionScore(
         // Level-based involves L0->L0 compactions that can lead to oversized
         // L0 files. Take into account size as well to avoid later giant
         // compactions to the base level.
-        score =
-            std::max(score, static_cast<double>(total_size) /
-                                mutable_cf_options.max_bytes_for_level_base);
+        if (immutable_cf_options.level_compaction_dynamic_level_bytes &&
+            immutable_cf_options.score_modify_advanced) {
+          if (total_size >= mutable_cf_options.max_bytes_for_level_base) {
+            // When calculating estimated_compaction_needed_bytes, we assume
+            // L0 is qualified as pending compactions. We will need to make
+            // sure that it qualifies for compaction.
+            // It might be guafanteed by logic below anyway, but we are
+            // explicit here to make sure we don't stop writes with no
+            // compaction scheduled.
+            score = std::max(score, 1.01);
+          }
+          if (total_size > level_max_bytes_[base_level_]) {
+            score = std::max(
+                score, static_cast<double>(total_size) /
+                           static_cast<double>(level_max_bytes_[base_level_]));
+          }
+        } else {
+          score =
+              std::max(score, static_cast<double>(total_size) /
+                                  mutable_cf_options.max_bytes_for_level_base);
+        }
       }
     } else {
       // Compute the ratio of current size to size limit.
       uint64_t level_bytes_no_compacting = 0;
       for (auto f : files_[level]) {
         if (!f->being_compacted) {
-          level_bytes_no_compacting += f->compensated_file_size;
+          if (immutable_cf_options.compensated_size_optimize) {
+            level_bytes_no_compacting += f->compensated_file_size;
+          } else {
+            level_bytes_no_compacting += f->fd.GetFileSize();
+          }
         }
       }
       score = static_cast<double>(level_bytes_no_compacting) /
@@ -2753,7 +2798,11 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
     for (int i = 1; i < num_levels_; i++) {
       uint64_t total_size = 0;
       for (const auto& f : files_[i]) {
-        total_size += f->compensated_file_size;
+        if (ioptions.compensated_size_optimize) {
+          total_size += f->compensated_file_size;
+        } else {
+          total_size += f->fd.GetFileSize();
+        }
       }
       if (total_size > 0 && first_non_empty_level == -1) {
         first_non_empty_level = i;
@@ -2775,11 +2824,19 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
     } else {
       uint64_t l0_size = 0;
       for (const auto& f : files_[0]) {
-        l0_size += f->compensated_file_size;
+        if (ioptions.compensated_size_optimize) {
+          l0_size += f->compensated_file_size;
+        } else {
+          l0_size += f->fd.GetFileSize();
+        }
       }
 
-      uint64_t base_bytes_max =
-          std::max(options.max_bytes_for_level_base, l0_size);
+      uint64_t base_bytes_max = 0L;
+      if (ioptions.score_modify) {
+        base_bytes_max = options.max_bytes_for_level_base;
+      } else {
+        base_bytes_max = std::max(options.max_bytes_for_level_base, l0_size);
+      }
       uint64_t base_bytes_min = static_cast<uint64_t>(
           base_bytes_max / options.max_bytes_for_level_multiplier);
 
@@ -2822,13 +2879,17 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
       assert(base_level_size > 0);
       base_level_size = std::max(base_level_size, l0_size);
 
-      if (base_level_ == num_levels_ - 1) {
-        level_multiplier_ = 1.0;
+      if (ioptions.score_modify) {
+        level_multiplier_ = options.max_bytes_for_level_multiplier;
       } else {
-        level_multiplier_ =
-            std::pow(static_cast<double>(max_level_size) /
-                         static_cast<double>(base_level_size),
-                     1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
+        if (base_level_ == num_levels_ - 1) {
+          level_multiplier_ = 1.0;
+        } else {
+          level_multiplier_ = std::pow(
+              static_cast<double>(max_level_size) /
+                  static_cast<double>(base_level_size),
+              1.0 / static_cast<double>(num_levels_ - base_level_ - 1));
+        }
       }
 
       uint64_t level_size = base_level_size;
@@ -4150,7 +4211,7 @@ Status VersionSet::ReduceNumberOfLevels(const std::string& dbname,
     new_files_list[new_levels - 1] = vstorage->LevelFiles(first_nonempty_level);
   }
 
-  delete[](vstorage->files_ - 1);
+  delete[] (vstorage->files_ - 1);
   vstorage->files_ = new_files_list;
   vstorage->num_levels_ = new_levels;
 

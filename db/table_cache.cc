@@ -28,6 +28,8 @@
 #include "util/stop_watch.h"
 #include "util/sync_point.h"
 
+extern thread_local int bts_file_level;
+
 namespace TERARKDB_NAMESPACE {
 
 namespace {
@@ -190,7 +192,10 @@ Status TableCache::GetTableReaderImpl(
   std::string fname =
       TableFileName(ioptions_.cf_paths, fd.GetNumber(), fd.GetPathId());
   std::unique_ptr<RandomAccessFile> file;
+
+  bts_file_level = level;
   Status s = ioptions_.env->NewRandomAccessFile(fname, &file, env_options);
+  bts_file_level = -2;
 
   RecordTick(ioptions_.statistics, NO_FILE_OPENS);
   if (s.ok()) {
@@ -207,12 +212,12 @@ Status TableCache::GetTableReaderImpl(
       file->Hint(RandomAccessFile::RANDOM);
     }
     StopWatch sw(ioptions_.env, ioptions_.statistics, TABLE_OPEN_IO_MICROS);
+    bts_file_level = level;
     std::unique_ptr<RandomAccessFileReader> file_reader(
-        new RandomAccessFileReader(
-            std::move(file), fname, ioptions_.env,
-            record_read_stats ? ioptions_.statistics : nullptr, SST_READ_MICROS,
-            file_read_hist, ioptions_.rate_limiter, for_compaction,
-            ioptions_.listeners));
+        new RandomAccessFileReader(std::move(file), fname, ioptions_.env,
+                                   ioptions_.statistics, SST_READ_MICROS,
+                                   file_read_hist, ioptions_.rate_limiter,
+                                   for_compaction, ioptions_.listeners));
     s = ioptions_.table_factory->NewTableReader(
         TableReaderOptions(ioptions_, prefix_extractor, env_options,
                            ioptions_.internal_comparator, skip_filters,
@@ -220,6 +225,7 @@ Status TableCache::GetTableReaderImpl(
                            fd.largest_seqno),
         std::move(file_reader), fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
+    bts_file_level = -2;
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
   }
   return s;
@@ -317,11 +323,13 @@ InternalIterator* TableCache::NewIterator(
   auto& fd = file_meta.fd;
   if (create_new_table_reader) {
     std::unique_ptr<TableReader> table_reader_unique_ptr;
+    bts_file_level = level;
     s = GetTableReader(env_options, fd, true /* sequential_mode */, readahead,
                        record_stats, nullptr, &table_reader_unique_ptr,
                        prefix_extractor, false /* skip_filters */, level,
                        true /* prefetch_index_and_filter_in_cache */,
                        for_compaction, file_meta.prop.is_map_sst());
+    bts_file_level = -2;
     if (s.ok()) {
       table_reader = table_reader_unique_ptr.release();
     }

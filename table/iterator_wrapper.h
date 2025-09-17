@@ -30,7 +30,7 @@ class IteratorWrapperBase {
       : iter_(nullptr) {
     Set(_iter);
   }
-  ~IteratorWrapperBase() {}
+  virtual ~IteratorWrapperBase() {}
   InternalIteratorBase<TValue>* iter() const { return iter_; }
 
   // Set the underlying Iterator to _iter and return
@@ -65,6 +65,11 @@ class IteratorWrapperBase {
     assert(Valid());
     return key_;
   }
+
+  uint64_t file_number() const { return iter_->file_number(); }
+
+  virtual void fetch_value() { iter_->fetch_value(); }
+
   TValue value() const {
     assert(Valid());
     return iter_->value();
@@ -129,6 +134,7 @@ class CombinedInternalIterator : public InternalIterator {
 
   bool Valid() const override { return iter_->Valid(); }
   Slice key() const override { return iter_->key(); }
+  uint64_t file_number() const override { return iter_->file_number(); }
   LazyBuffer value() const override;
   LazyBuffer value(const Slice& user_key, std::string* meta) const;
   Status status() const override { return iter_->status(); }

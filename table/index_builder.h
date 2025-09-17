@@ -41,7 +41,7 @@ class IndexBuilder {
       const TERARKDB_NAMESPACE::InternalKeyComparator* comparator,
       const InternalKeySliceTransform* int_key_slice_transform,
       const bool use_value_delta_encoding,
-      const BlockBasedTableOptions& table_opt);
+      const BlockBasedTableOptions& table_opt, MetaType type);
 
   // Index builder will construct a set of blocks which contain:
   //  1. One primary index block.
@@ -124,32 +124,39 @@ class ShortenedIndexBuilder : public IndexBuilder {
   explicit ShortenedIndexBuilder(const InternalKeyComparator* comparator,
                                  const int index_block_restart_interval,
                                  const uint32_t format_version,
-                                 const bool use_value_delta_encoding)
+                                 const bool use_value_delta_encoding,
+                                 const bool blob_single_key_block)
       : IndexBuilder(comparator),
         index_block_builder_(index_block_restart_interval,
                              true /*use_delta_encoding*/,
                              use_value_delta_encoding),
         index_block_builder_without_seq_(index_block_restart_interval,
                                          true /*use_delta_encoding*/,
-                                         use_value_delta_encoding) {
+                                         use_value_delta_encoding),
+        use_full_key_index_for_blob(blob_single_key_block) {
     // Making the default true will disable the feature for old versions
-    seperator_is_key_plus_seq_ = (format_version <= 2);
+    seperator_is_key_plus_seq_ =
+        (format_version <= 2) || use_full_key_index_for_blob;
   }
 
   virtual void AddIndexEntry(std::string* last_key_in_current_block,
                              const Slice* first_key_in_next_block,
                              const BlockHandle& block_handle) override {
-    if (first_key_in_next_block != nullptr) {
-      comparator_->FindShortestSeparator(last_key_in_current_block,
-                                         *first_key_in_next_block);
-      if (!seperator_is_key_plus_seq_ &&
-          comparator_->user_comparator()->Compare(
-              ExtractUserKey(*last_key_in_current_block),
-              ExtractUserKey(*first_key_in_next_block)) == 0) {
-        seperator_is_key_plus_seq_ = true;
-      }
+    if (use_full_key_index_for_blob) {
+      seperator_is_key_plus_seq_ = true;
     } else {
-      comparator_->FindShortSuccessor(last_key_in_current_block);
+      if (first_key_in_next_block != nullptr) {
+        comparator_->FindShortestSeparator(last_key_in_current_block,
+                                           *first_key_in_next_block);
+        if (!seperator_is_key_plus_seq_ &&
+            comparator_->user_comparator()->Compare(
+                ExtractUserKey(*last_key_in_current_block),
+                ExtractUserKey(*first_key_in_next_block)) == 0) {
+          seperator_is_key_plus_seq_ = true;
+        }
+      } else {
+        comparator_->FindShortSuccessor(last_key_in_current_block);
+      }
     }
     auto sep = Slice(*last_key_in_current_block);
 
@@ -196,6 +203,7 @@ class ShortenedIndexBuilder : public IndexBuilder {
   BlockBuilder index_block_builder_without_seq_;
   bool seperator_is_key_plus_seq_;
   BlockHandle last_encoded_handle_;
+  bool use_full_key_index_for_blob;
 };
 
 // HashIndexBuilder contains a binary-searchable primary index and the
@@ -233,7 +241,7 @@ class HashIndexBuilder : public IndexBuilder {
                             int format_version, bool use_value_delta_encoding)
       : IndexBuilder(comparator),
         primary_index_builder_(comparator, index_block_restart_interval,
-                               format_version, use_value_delta_encoding),
+                               format_version, use_value_delta_encoding, false),
         hash_key_extractor_(hash_key_extractor) {}
 
   virtual void AddIndexEntry(std::string* last_key_in_current_block,

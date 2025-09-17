@@ -22,6 +22,26 @@ extern thread_local PerfContext perf_context;
 #endif
 #endif
 
+#if defined(NPERF_CONTEXT) || !defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
+extern DBOperationType db_operation_type;
+#else
+#if defined(OS_SOLARIS)
+extern __thread DBOperationType db_operation_type;
+#else
+extern thread_local DBOperationType db_operation_type;
+#endif
+#endif
+
+#if defined(NPERF_CONTEXT) || !defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
+extern BGOperationType bg_operation_type;
+#else
+#if defined(OS_SOLARIS)
+extern __thread BGOperationType bg_operation_type;
+#else
+extern thread_local BGOperationType bg_operation_type;
+#endif
+#endif
+
 #if defined(NPERF_CONTEXT)
 
 #define PERF_TIMER_GUARD(metric)

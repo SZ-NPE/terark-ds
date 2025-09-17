@@ -84,7 +84,7 @@ struct TableBuilderOptions {
       CompressionType _compression_type,
       const CompressionOptions& _compression_opts,
       const std::string* _compression_dict, bool _skip_filters,
-      const std::string& _column_family_name, int _level,
+      uint64_t _meta_type, const std::string& _column_family_name, int _level,
       double _compaction_load, uint64_t _creation_time = 0,
       int64_t _oldest_key_time = 0, SstPurpose _sst_purpose = kEssenceSst)
       : ioptions(_ioptions),
@@ -95,6 +95,7 @@ struct TableBuilderOptions {
         compression_opts(_compression_opts),
         compression_dict(_compression_dict),
         skip_filters(_skip_filters),
+        meta_type(_meta_type),
         column_family_name(_column_family_name),
         level(_level),
         compaction_load(_compaction_load),
@@ -111,6 +112,9 @@ struct TableBuilderOptions {
   // Data for presetting the compression library's dictionary, or nullptr.
   const std::string* compression_dict;
   bool skip_filters;  // only used by BlockBasedTableBuilder
+  // default: keysst
+  // create a HashEngine table when meta_type is blob
+  uint64_t meta_type;
   // Ignore key type, force store all keys, no tombstones
   const std::string& column_family_name;
   int level;  // what level this table/file is on, -1 for "not set, don't know"

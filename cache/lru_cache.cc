@@ -384,7 +384,7 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
   e->SetInCache(true);
   e->SetPriority(priority);
   memcpy(e->key_data, key.data(), key.size());
-
+  bool oversize = false;
   {
     MutexLock l(&mutex_);
 
@@ -392,7 +392,8 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
     // is freed or the lru list is empty
     EvictFromLRU(charge, &last_reference_list);
 
-    if (usage_ - lru_usage_ + charge > capacity_ &&
+    oversize = usage_ - lru_usage_ + charge > capacity_;
+    if (oversize &&
         (strict_capacity_limit_ || handle == nullptr)) {
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry inserted
@@ -425,6 +426,9 @@ Status LRUCacheShardTemplate<CacheMonitor>::Insert(
         *handle = reinterpret_cast<Cache::Handle*>(e);
       }
       s = Status::OK();
+      if (oversize && charge > capacity_) {
+        s = Status::OKWithCacheNoSpace();
+      }
     }
   }
 

@@ -37,6 +37,7 @@ enum Tickers : uint32_t {
   BLOCK_CACHE_HIT,
   // # of blocks added to block cache.
   BLOCK_CACHE_ADD,
+  BLOCK_CACHE_READ,
   // # of failures when adding blocks to block cache.
   BLOCK_CACHE_ADD_FAILURES,
   // # of times cache miss when accessing index block from block cache.
@@ -258,9 +259,59 @@ enum Tickers : uint32_t {
   GC_TOUCH_FILES,
   GC_SKIP_GET_BY_SEQ,
   GC_SKIP_GET_BY_FILE,
+  GC_INPUT_BYTES,
+
+  GC_READ_BYTES,
+  GC_WRITE_BYTES,
+  GC_CLEAR_BYTES,
+  GC_INPUT_FILES,
+  GC_OUTPUT_FILES,
+  GC_GETKEY_READ_BYTES,
+
+  GC_COUNT,
+  GC_READ_COUNT,
+  GC_GETKEY_COUNT,
+  GC_WRITE_COUNT,
+  GC_FETCH_VAL_COUNT,
+
+  GC_WRITE_INDEX_KEY_BLOCK_COUNT,
+  GC_INDEX_KEY_MAP_READ_COUNT,
 
   READ_BLOB_VALID,
   READ_BLOB_INVALID,
+  // Add block cache related monitoring parameters
+  BLOCK_CACHE_HIT_FG,
+  BLOCK_CACHE_MISS_FG,
+  BLOCK_CACHE_HIT_BG,
+  BLOCK_CACHE_MISS_BG,
+
+  INDEX_KEY_MAP_CACHE_ADD,
+  INDEX_KEY_MAP_CACHE_HIT,
+  INDEX_KEY_MAP_CACHE_MISS,
+  INDEX_KEY_MAP_MEM_HIT,
+
+  BLOCK_CACHE_HIT_GET_KEYS,
+  BLOCK_CACHE_MISS_GET_KEYS,
+  BLOCK_CACHE_HIT_GC_READ,
+  BLOCK_CACHE_MISS_GC_READ,
+
+  HOT_BLOB_VALUE_ENTRY,
+  COLD_BLOB_VALUE_ENTRY,
+
+  HOT_BLOB_FILE_NUM,
+  COLD_BLOB_FILE_NUM,
+
+  RANDOM_IO_READ_BYTES,
+  IO_WRITE_BYTES,
+
+  FLUSH_IO_READ_BYTES,
+  FLUSH_IO_WRITE_BYTES,
+  COMPACTION_IO_READ_BYTES,
+  COMPACTION_IO_WRITE_BYTES,
+  FG_IO_READ_BYTES,
+  FG_IO_WRITE_BYTES,
+  GC_IO_READ_BYTES,
+  GC_IO_WRITE_BYTES,
 
   TICKER_ENUM_MAX
 };
@@ -286,6 +337,12 @@ enum Histograms : uint32_t {
   COMPACTION_OUTFILE_SYNC_MICROS,
   WAL_FILE_SYNC_MICROS,
   MANIFEST_FILE_SYNC_MICROS,
+  // garbage collection latency
+  GC_GET_KEY_TIME,
+  GC_FETCH_VALUE_TIME,
+  GC_READ_TIME,
+  GC_WRITE_TIME,
+  GC_ALL_TIME,
   // TIME SPENT IN IO DURING TABLE OPEN
   TABLE_OPEN_IO_MICROS,
   DB_MULTIGET,
@@ -325,6 +382,13 @@ enum Histograms : uint32_t {
   INSTALL_SUPER_VERSION_TIME,
   BUILD_VERSION_TIME,
 
+  FS_APPEND_IO_SIZE,
+  FS_APPEND_IO_MICROS,
+  FS_SST_IO_SIZE,
+  FS_SST_IO_MICROS,
+  FS_WAL_IO_SIZE,
+  FS_WAL_IO_MICROS,
+
   HISTOGRAM_ENUM_MAX,
 };
 
@@ -340,6 +404,7 @@ struct HistogramData {
   // zero-initialize new members since old Statistics::histogramData()
   // implementations won't write them.
   double max = 0.0;
+  double min = 0.0;
   uint64_t count = 0;
   uint64_t sum = 0;
 };

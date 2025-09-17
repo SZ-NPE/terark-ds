@@ -100,6 +100,10 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kColumnFamilyId, props.column_family_id);
   Add(TablePropertiesNames::kCreationTime, props.creation_time);
   Add(TablePropertiesNames::kOldestKeyTime, props.oldest_key_time);
+  Add(TablePropertiesNames::kSeparatedEntryCount, props.separated_entry_count);
+  Add(TablePropertiesNames::kUseIndexKeyBlock, props.use_index_key_block);
+  Add(TablePropertiesNames::kSSTMetaType, props.meta_type);
+  Add(TablePropertiesNames::kBlobSingleKeyBlock, props.blob_single_key_block);
   if (!props.snapshots.empty()) {
     Add(TablePropertiesNames::kSnapshots, props.snapshots);
   }
@@ -288,6 +292,13 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
        &new_table_properties->creation_time},
       {TablePropertiesNames::kOldestKeyTime,
        &new_table_properties->oldest_key_time},
+      {TablePropertiesNames::kSeparatedEntryCount,
+       &new_table_properties->separated_entry_count},
+      {TablePropertiesNames::kUseIndexKeyBlock,
+       &new_table_properties->use_index_key_block},
+      {TablePropertiesNames::kSSTMetaType, &new_table_properties->meta_type},
+      {TablePropertiesNames::kBlobSingleKeyBlock,
+       &new_table_properties->blob_single_key_block},
   };
 
   auto GetUint64Vector = [&](const std::string& key, Slice* raw_val,

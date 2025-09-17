@@ -84,6 +84,14 @@
 #include "util/sync_point.h"
 #include "utilities/util/valvec.hpp"
 
+extern thread_local int bts_file_level;
+bool enable_remote_compaction = true;
+
+#ifdef GC_READAHEAD
+thread_local int gc_read_ahead_size = -1;
+thread_local bool revert_rh_buffer = false;
+#endif
+
 namespace TERARKDB_NAMESPACE {
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
@@ -583,6 +591,9 @@ struct CompactionJob::SubcompactionState {
     for (auto& pair : blob_map) {
       auto meta = pair.second.first;
       uint64_t total_bytes = meta->fd.GetFileSize();
+      if (meta->prop.num_entries == 0) {
+        continue;
+      }
       uint64_t ref_bytes =
           total_bytes * pair.second.second / meta->prop.num_entries;
       output->blobs.emplace_back(BlobRefInfo{pair.first, meta, ref_bytes});
@@ -1001,7 +1012,8 @@ Status CompactionJob::Run() {
         GetCmdLineDispatcher());
     dispatcher = command_line_dispatcher.get();
   }
-  if (!dispatcher || c->compaction_type() != kKeyValueCompaction) {
+  if (!dispatcher || c->compaction_type() != kKeyValueCompaction ||
+      !enable_remote_compaction) {
     return RunSelf();
   }
   Status s;
@@ -1161,13 +1173,15 @@ Status CompactionJob::Run() {
           output.meta.marked_for_compaction = file_info.marked_for_compaction;
           // output.stat_one = std::move(file_info.stat_one);
           std::unique_ptr<TERARKDB_NAMESPACE::RandomAccessFile> file;
+          bts_file_level = sub_compact.compaction->output_level();
           s = env_->NewRandomAccessFile(fname, &file, env_options_);
+          bts_file_level = -2;
           if (!s.ok()) {
             break;
           }
           std::unique_ptr<TERARKDB_NAMESPACE::RandomAccessFileReader>
               file_reader(new TERARKDB_NAMESPACE::RandomAccessFileReader(
-                  std::move(file), fname, env_));
+                  std::move(file), fname, env_, stats_));
           std::unique_ptr<TERARKDB_NAMESPACE::TableReader> reader;
           TableReaderOptions table_reader_options(
               *c->immutable_cf_options(),
@@ -1448,8 +1462,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   UpdateCompactionJobStats(stats);
 
   auto stream = event_logger_->LogToBuffer(log_buffer_);
-  stream << "job" << job_id_ << "event"
-         << "compaction_finished"
+  stream << "job" << job_id_ << "event" << "compaction_finished"
          << "compaction_time_micros" << compaction_stats_.micros
          << "output_level" << compact_->compaction->output_level()
          << "num_output_files" << compact_->NumOutputFiles()
@@ -1483,6 +1496,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
 
 void CompactionJob::ProcessCompaction(SubcompactionState* sub_compact) {
   // SetThreadSched(kSchedIdle);
+  auto mutable_cf_options_ = sub_compact->compaction->mutable_cf_options();
   switch (sub_compact->compaction->compaction_type()) {
     case kKeyValueCompaction:
       ProcessKeyValueCompaction(sub_compact);
@@ -1491,7 +1505,11 @@ void CompactionJob::ProcessCompaction(SubcompactionState* sub_compact) {
       assert(false);
       break;
     case kGarbageCollection:
-      ProcessGarbageCollection(sub_compact);
+      if (mutable_cf_options_->gc_adpative_readahead) {
+        ProcessGarbageCollectionInBatch(sub_compact);
+      } else {
+        ProcessGarbageCollection(sub_compact);
+      }      
       break;
     default:
       assert(false);
@@ -1687,6 +1705,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       versions_->LastSequence(), &existing_snapshots_,
       earliest_write_conflict_snapshot_, snapshot_checker_, env_,
       ShouldReportDetailedTime(env_, stats_), false, &range_del_agg,
+      cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
       sub_compact->compaction, mutable_cf_options->get_blob_config(),
       compaction_filter, shutting_down_, preserve_deletes_seqnum_,
       &rebuild_blobs_info.blobs));
@@ -1741,6 +1760,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         cfd->user_comparator(), merge_ptr, versions_->LastSequence(),
         &existing_snapshots_, earliest_write_conflict_snapshot_,
         snapshot_checker_, env_, false, false, range_del_agg_ptr,
+        cfd->ioptions()->drop_key_cache, cfd->ioptions()->hotness_aware,
         sub_compact->compaction, mutable_cf_options->get_blob_config(),
         second_pass_iter_storage.compaction_filter, shutting_down_,
         preserve_deletes_seqnum_, &rebuild_blobs_info.blobs);
@@ -2038,245 +2058,908 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   sub_compact->status = status;
 }  // namespace TERARKDB_NAMESPACE
 
+void CompactionJob::ProcessGarbageCollectionInBatch(
+    SubcompactionState* sub_compact) {
+#ifdef GC_READAHEAD
+  gc_read_ahead_size = 0 * 1024;
+#endif
+
+  uint64_t total_gc_time = 0;
+  uint64_t getkey_time = 0;
+  uint64_t read_time = 0;
+  uint64_t write_time = 0;
+  uint64_t fetch_val_time = 0;
+
+  uint64_t getkey_count = 0;
+  uint64_t read_count = 0;
+  uint64_t write_count = 0;
+  uint64_t fetch_val_count = 0;
+
+  std::unordered_map<uint64_t, std::vector<bool>> valid_bits;  // valid key bits
+  {
+    StopWatch gc_total_sw(env_, nullptr, 0, &total_gc_time, false, false);
+    uint64_t gc_begin_reads = IOSTATS(bytes_read);
+    uint64_t gc_begin_writes = IOSTATS(bytes_written);
+
+    ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
+
+    std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
+        sub_compact->compaction, nullptr, env_options_for_read_));
+
+    AutoThreadOperationStageUpdater stage_updater(
+        ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
+
+    // I/O measurement variables
+    PerfLevel prev_perf_level = PerfLevel::kEnableTime;
+    const uint64_t kRecordStatsEvery = 1000;
+    uint64_t prev_write_nanos = 0;
+    uint64_t prev_fsync_nanos = 0;
+    uint64_t prev_range_sync_nanos = 0;
+    uint64_t prev_prepare_write_nanos = 0;
+    if (measure_io_stats_) {
+      prev_perf_level = GetPerfLevel();
+      SetPerfLevel(PerfLevel::kEnableTime);
+      prev_write_nanos = IOSTATS(write_nanos);
+      prev_fsync_nanos = IOSTATS(fsync_nanos);
+      prev_range_sync_nanos = IOSTATS(range_sync_nanos);
+      prev_prepare_write_nanos = IOSTATS(prepare_write_nanos);
+    }
+
+    input->SeekToFirst();
+
+    Arena arena;
+    std::unordered_map<Slice, uint64_t, SliceHasher> conflict_map;
+    std::mutex conflict_map_mutex;
+
+    auto create_iter = [&](Arena* /* arena */) {
+      return versions_->MakeInputIterator(sub_compact->compaction, nullptr,
+                                          env_options_for_read_);
+    };
+    auto filter_conflict = [&](const Slice& ikey, const LazyBuffer& value) {
+      std::lock_guard<std::mutex> lock(conflict_map_mutex);
+      auto find = conflict_map.find(ikey);
+      return find != conflict_map.end() && find->second != value.file_number();
+    };
+
+    LazyInternalIteratorWrapper second_pass_iter(
+        c_style_callback(create_iter), &create_iter,
+        c_style_callback(filter_conflict), &filter_conflict,
+        nullptr /* arena */, shutting_down_);
+
+    Status status = OpenCompactionOutputBlob(sub_compact);
+    if (!status.ok()) {
+      return;
+    }
+    sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
+
+    Version* input_version = sub_compact->compaction->input_version();
+    auto& dependence_map = input_version->storage_info()->dependence_map();
+    auto& comp = cfd->internal_comparator();
+    std::string last_key;
+    uint64_t last_file_number = kInvalidFileNumber;
+    IterKey iter_key;
+    ParsedInternalKey ikey;
+    struct {
+      uint64_t input = 0;
+      uint64_t garbage_type = 0;
+      uint64_t get_not_found = 0;
+      uint64_t file_number_mismatch = 0;
+    } counter;
+
+    struct GC_RH_Status {
+      int counter = 0;
+      int gc_rh_end = 0;
+      int gc_rh_size = 0;
+      int last_gc_rh_size = 0;
+      int avg_size = 0;
+    };
+    std::map<uint64_t, GC_RH_Status> gc_rh_map;
+    const std::vector<FileMetaData*> gc_input_files =
+        sub_compact->compaction->inputs()->front().files;
+    for (FileMetaData* it : gc_input_files) {
+      uint64_t blob_file_number = it->fd.GetNumber();
+      valid_bits.emplace(blob_file_number, std::vector<bool>());
+      gc_rh_map[blob_file_number] = GC_RH_Status();
+    }
+
+    std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
+    blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
+    while (status.ok() && !cfd->IsDropped() && input->Valid()) {
+      ++counter.input;
+      // key from blob
+      Slice curr_key = input->key();
+      uint64_t curr_file_number = kInvalidFileNumber;
+      if (!ParseInternalKey(curr_key, &ikey)) {
+        status =
+            Status::Corruption("ProcessGarbageCollection invalid InternalKey");
+        break;
+      }
+      uint64_t blob_file_number = input->file_number();
+      FileMetaData* blob_meta;
+      auto find_cache = std::find_if(
+          blob_meta_cache.begin(), blob_meta_cache.end(),
+          [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
+            return pair.first == blob_file_number;
+          });
+      if (find_cache != blob_meta_cache.end()) {
+        blob_meta = find_cache->second;
+      } else {
+        auto find_dependence_map = dependence_map.find(blob_file_number);
+        if (find_dependence_map == dependence_map.end()) {
+          status =
+              Status::Corruption("ProcessGarbageCollection internal error !");
+          break;
+        }
+        blob_meta = find_dependence_map->second;
+        blob_meta_cache.emplace_back(blob_file_number, blob_meta);
+      }
+      do {
+        if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
+          ++counter.garbage_type;
+          break;
+        }
+
+        iter_key.SetInternalKey(ikey.user_key, ikey.sequence,
+                                kValueTypeForSeek);
+        Status s;
+        ValueType type = kTypeDeletion;
+        SequenceNumber seq = kMaxSequenceNumber;
+        LazyBuffer value;
+        {
+          StopWatch getkey_sw(env_, nullptr, 0, &getkey_time, false, false);
+          getkey_count++;
+          input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s,
+                                &type, &seq, &value, *blob_meta);
+        }
+
+        if (s.IsNotFound()) {
+          ++counter.get_not_found;
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        } else if (!s.ok()) {
+          status = std::move(s);
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        } else if (seq != ikey.sequence ||
+                   (type != kTypeValueIndex && type != kTypeMergeIndex)) {
+          ++counter.get_not_found;
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        }
+        status = value.fetch();
+        if (!status.ok()) {
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        }
+        uint64_t file_number = SeparateHelper::DecodeFileNumber(value.slice());
+        auto find = dependence_map.find(file_number);
+        if (find == dependence_map.end()) {
+          status = Status::Corruption("Separate value dependence missing");
+          break;
+        }
+        valid_bits[blob_file_number].push_back(true);  // 设置对应的 bit 为 1
+      } while (false);
+
+      if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
+          (last_file_number & curr_file_number) != kInvalidFileNumber) {
+        uint64_t valid_file_number = last_file_number & curr_file_number;
+        auto pinned_key = ArenaPinSlice(curr_key, &arena);
+        std::lock_guard<std::mutex> lock(conflict_map_mutex);
+        conflict_map.emplace(pinned_key, valid_file_number);
+      }
+      last_key.assign(curr_key.data(), curr_key.size());
+      last_file_number = curr_file_number;
+
+      {
+        StopWatch read_sw(env_, nullptr, 0, &read_time, false, false);
+        read_count++;
+        last_key.assign(curr_key.data(), curr_key.size());
+        last_file_number = curr_file_number;
+
+        input->Next();
+      }
+      if (shutting_down_ && shutting_down_->load(std::memory_order_relaxed)) {
+        status = Status::ShutdownInProgress();
+      }
+    }
+
+    // **************** GC Write *****************************
+    input->SeekToFirst();
+    int def_rh_size = 0 * 1024;
+    // int def_rh_size = 512 * 1024;
+    int align_size = 4 * 1024;
+    while (status.ok() && !cfd->IsDropped() && input->Valid()) {
+      uint64_t blob_file_number = input->file_number();
+      GC_RH_Status& gc_rh_status = gc_rh_map[blob_file_number];
+      uint64_t curr_count = gc_rh_status.counter;
+      std::vector<bool> curr_bitset = valid_bits[blob_file_number];
+      if (!curr_bitset[curr_count]) {
+        gc_rh_status.counter++;
+        input->Next();
+        continue;
+      }
+
+      Slice curr_key = input->key();
+
+#ifdef GC_READAHEAD
+      FileMetaData* blob_meta = nullptr;
+      auto find_cache = std::find_if(
+          blob_meta_cache.begin(), blob_meta_cache.end(),
+          [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
+            return pair.first == blob_file_number;
+          });
+      if (find_cache != blob_meta_cache.end()) {
+        blob_meta = find_cache->second;
+      }
+      gc_rh_status.avg_size =
+          blob_meta->compensated_file_size / blob_meta->prop.num_entries;
+      int rh_window_size = 0;
+      gc_rh_status.last_gc_rh_size = gc_rh_status.gc_rh_size;
+      if (curr_count >=
+          gc_rh_status.gc_rh_end) {  // 超过了上次预取的范围则重新计算预取大小
+        int key_size = curr_bitset.size();
+        for (int rh_end = curr_count; rh_end < key_size && curr_bitset[rh_end];
+             rh_end++) {
+          rh_window_size += 1;
+        }
+        assert(rh_window_size >= 1);
+        int check_window_size = def_rh_size / gc_rh_status.avg_size;
+        int rh_threshold = check_window_size * 0.5;
+        // if (rh_window_size == 1) { // 离散的单条有效数据，使用预取窗口检测。
+        if (rh_window_size > check_window_size) {
+          gc_read_ahead_size = std::min(
+              rh_window_size * (gc_rh_status.avg_size / align_size + 1) *
+                  align_size,
+              2 * 1024 * 1024);
+        } else {
+          int valid_count = rh_window_size;
+          int invalid_count = 0;
+          int window_pointer = rh_window_size + curr_count;
+          int window_end = check_window_size + curr_count;
+          for (; window_pointer < window_end && window_pointer < key_size;
+               window_pointer++) {
+            if (curr_bitset[window_pointer]) {
+              if (++valid_count >= rh_threshold) {
+                rh_window_size = check_window_size;
+                gc_read_ahead_size = def_rh_size;
+                break;
+              }
+            } else {
+              if (++invalid_count > rh_threshold) {
+                gc_read_ahead_size = 0;
+                break;
+              }
+            }
+          }
+        }
+        // uint64_t fg_read_band_ratio =
+        // stats_->getTickerCount(FG_IO_READ_BAND_RATIO); bool read_bottle =
+        // fg_read_band_ratio > 20; if (read_bottle) {
+        //   rh_window_size = rh_window_size / 2;
+        //   gc_read_ahead_size = gc_read_ahead_size / 2;
+        // }
+        gc_rh_status.gc_rh_end = curr_count + rh_window_size;
+        gc_rh_status.gc_rh_size = gc_read_ahead_size;
+      } else {  // 仍在上次的预取范围内，预取大小保持不变
+        gc_read_ahead_size = gc_rh_status.gc_rh_size;
+      }
+      // std::cout << "[GC Readahead Size]  "  << gc_read_ahead_size <<
+      // std::endl; gc_read_ahead_size = 2048 * 1024;
+      assert(gc_read_ahead_size == gc_rh_map[blob_file_number].gc_rh_size);
+      revert_rh_buffer =
+          gc_rh_status.last_gc_rh_size != gc_rh_status.gc_rh_size;
+#endif
+
+      LazyBuffer value;
+      do {
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] GC check valid and prepare fetch value" << std::endl;
+#endif
+        {
+          StopWatch fetch_val_sw(env_, nullptr, 0, &fetch_val_time, false,
+                                 false);
+          fetch_val_count++;
+          input->fetch_value();
+          value = input->value();
+        }
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] GC fetch value size " << value.size() << std::endl;
+#endif
+        // input: curr_key, value
+        {
+          StopWatch write_sw(env_, nullptr, 0, &write_time, false, false);
+          write_count++;
+          status = sub_compact->blob_builder->Add(curr_key, value);
+        }
+        if (!status.ok()) {
+          gc_rh_status.counter++;
+          break;
+        }
+        sub_compact->current_blob_output()->meta.UpdateBoundaries(
+            curr_key, ikey.sequence);
+        sub_compact->num_output_records++;
+        gc_rh_status.counter++;
+      } while (false);
+      input->Next();
+    }
+
+    uint64_t gc_end_reads = IOSTATS(bytes_read);
+    uint64_t gc_end_writes = IOSTATS(bytes_written);
+    RecordTick(stats_, GC_READ_BYTES, gc_end_reads - gc_begin_reads);
+    RecordTick(stats_, GC_WRITE_BYTES, gc_end_writes - gc_begin_writes);
+
+    IOSTATS_RESET(bytes_read);
+    IOSTATS_RESET(bytes_written);
+
+    if (status.ok() &&
+        (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
+      status = Status::ShutdownInProgress(
+          "Database shutdown or Column family drop during compaction");
+    }
+    if (status.ok()) {
+      status = input->status();
+    }
+    std::vector<uint64_t> inheritance_tree;
+    size_t inheritance_tree_pruge_count = 0;
+    if (status.ok()) {
+      status = BuildInheritanceTree(
+          *sub_compact->compaction->inputs(), dependence_map, input_version,
+          &inheritance_tree, &inheritance_tree_pruge_count);
+    }
+    Status s =
+        FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+    if (status.ok()) {
+      status = s;
+    }
+    if (status.ok()) {
+      auto& meta = sub_compact->blob_outputs.front().meta;
+      auto& inputs = *sub_compact->compaction->inputs();
+      auto& files = inputs.front().files;
+      uint64_t total_file_size = 0;
+      for (auto& file : files) {
+        total_file_size += file->raw_size();
+      }
+
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
+          " inputs from %zd files. %" PRIu64
+          " clear, %.2f%% entry estimation, raw %" PRIu64
+          " size estimation: [ %" PRIu64 " garbage type, %" PRIu64
+          " get not found, %" PRIu64
+          " file number mismatch ], inheritance tree: %zd -> %zd",
+          cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
+          files.size(), counter.input - meta.prop.num_entries,
+          sub_compact->compaction->num_antiquation() * 100. / counter.input,
+          total_file_size, counter.garbage_type, counter.get_not_found,
+          counter.file_number_mismatch,
+          meta.prop.inheritance.size() + inheritance_tree_pruge_count,
+          meta.prop.inheritance.size());
+
+      bool do_delete =
+          ((std::find_if(files.begin(), files.end(),
+                         [](FileMetaData* f) {
+                           return f->marked_for_compaction;
+                         }) == files.end() &&
+            files.size() == 1 && counter.input == meta.prop.num_entries) ||
+           meta.prop.num_entries == 0);
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ProcessGarbageCollection:test_delete", &do_delete);
+      if (do_delete) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "[%s] [JOB %d] Table #%" PRIu64
+                       " GC purge %s records, dropped",
+                       cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
+                       meta.prop.num_entries == 0 ? "whole" : "0");
+        std::string fname = TableFileName(
+            sub_compact->compaction->immutable_cf_options()->cf_paths,
+            meta.fd.GetNumber(), meta.fd.GetPathId());
+        env_->DeleteFile(fname);
+#ifndef ROCKSDB_LITE
+        EventHelpers::LogAndNotifyTableFileDeletion(
+            event_logger_, job_id_, meta.fd.GetNumber(), fname, status, dbname_,
+            cfd->ioptions()->listeners);
+#endif  // !ROCKSDB_LITE
+        sub_compact->blob_outputs.clear();
+      }
+    }
+
+    if (measure_io_stats_) {
+      sub_compact->compaction_job_stats.file_write_nanos +=
+          IOSTATS(write_nanos) - prev_write_nanos;
+      sub_compact->compaction_job_stats.file_fsync_nanos +=
+          IOSTATS(fsync_nanos) - prev_fsync_nanos;
+      sub_compact->compaction_job_stats.file_range_sync_nanos +=
+          IOSTATS(range_sync_nanos) - prev_range_sync_nanos;
+      sub_compact->compaction_job_stats.file_prepare_write_nanos +=
+          IOSTATS(prepare_write_nanos) - prev_prepare_write_nanos;
+      if (prev_perf_level != PerfLevel::kEnableTime) {
+        SetPerfLevel(prev_perf_level);
+      }
+    }
+
+    input.reset();
+    sub_compact->status = status;
+  }
+
+  MeasureTime(stats_, GC_ALL_TIME, total_gc_time);
+  RecordTick(stats_, GC_COUNT, 1);
+
+  MeasureTime(stats_, GC_GET_KEY_TIME, getkey_time);
+  RecordTick(stats_, GC_GETKEY_COUNT, getkey_count);
+
+  MeasureTime(stats_, GC_READ_TIME, read_time);
+  RecordTick(stats_, GC_READ_COUNT, read_count);
+
+  MeasureTime(stats_, GC_WRITE_TIME, write_time);
+  RecordTick(stats_, GC_WRITE_COUNT, write_count);
+
+  MeasureTime(stats_, GC_FETCH_VALUE_TIME, fetch_val_time);
+  RecordTick(stats_, GC_FETCH_VAL_COUNT, fetch_val_count);
+
+#ifdef GC_READAHEAD
+  gc_read_ahead_size = -1;
+  revert_rh_buffer = false;
+#endif
+}
+
 void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
   assert(sub_compact != nullptr);
-  ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
+#ifdef GC_READAHEAD
+  gc_read_ahead_size = 0 * 1024;
+#endif
 
-  std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
-      sub_compact->compaction, nullptr, env_options_for_read_));
+  RecordTick(stats_, GC_INPUT_BYTES,
+             sub_compact->compaction->CalculateTotalInputSize());
+  StopWatch sw(env_, stats_, GC_ALL_TIME);
+  uint64_t total_gc_time = 0;
+  uint64_t getkey_time = 0;
+  uint64_t read_time = 0;
+  uint64_t write_time = 0;
+  uint64_t fetch_val_time = 0;
 
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
+  uint64_t getkey_count = 0;
+  uint64_t read_count = 0;
+  uint64_t write_count = 0;
+  uint64_t fetch_val_count = 0;
 
-  // I/O measurement variables
-  PerfLevel prev_perf_level = PerfLevel::kEnableTime;
-  uint64_t prev_write_nanos = 0;
-  uint64_t prev_fsync_nanos = 0;
-  uint64_t prev_range_sync_nanos = 0;
-  uint64_t prev_prepare_write_nanos = 0;
-  if (measure_io_stats_) {
-    prev_perf_level = GetPerfLevel();
-    SetPerfLevel(PerfLevel::kEnableTime);
-    prev_write_nanos = IOSTATS(write_nanos);
-    prev_fsync_nanos = IOSTATS(fsync_nanos);
-    prev_range_sync_nanos = IOSTATS(range_sync_nanos);
-    prev_prepare_write_nanos = IOSTATS(prepare_write_nanos);
-  }
+  std::unordered_map<uint64_t, std::vector<bool>> valid_bits;  // valid key bits
+  {
+    StopWatch gc_total_sw(env_, nullptr, 0, &total_gc_time, false, false);
+    uint64_t gc_begin_reads = IOSTATS(bytes_read);
+    uint64_t gc_begin_writes = IOSTATS(bytes_written);
 
-  assert(sub_compact->start == nullptr);
-  assert(sub_compact->end == nullptr);
+    ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
 
-  input->SeekToFirst();
+    std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
+        sub_compact->compaction, nullptr, env_options_for_read_));
 
-  Arena arena;
-  std::unordered_map<Slice, uint64_t, SliceHasher> conflict_map;
-  std::mutex conflict_map_mutex;
+    AutoThreadOperationStageUpdater stage_updater(
+        ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
 
-  auto create_iter = [&](Arena* /* arena */) {
-    return versions_->MakeInputIterator(sub_compact->compaction, nullptr,
-                                        env_options_for_read_);
-  };
-  auto filter_conflict = [&](const Slice& ikey, const LazyBuffer& value) {
-    std::lock_guard<std::mutex> lock(conflict_map_mutex);
-    auto find = conflict_map.find(ikey);
-    return find != conflict_map.end() && find->second != value.file_number();
-  };
-
-  LazyInternalIteratorWrapper second_pass_iter(
-      c_style_callback(create_iter), &create_iter,
-      c_style_callback(filter_conflict), &filter_conflict, nullptr /* arena */,
-      shutting_down_);
-
-  Status status = OpenCompactionOutputBlob(sub_compact);
-  if (!status.ok()) {
-    return;
-  }
-  sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
-
-  Version* input_version = sub_compact->compaction->input_version();
-  auto& dependence_map = input_version->storage_info()->dependence_map();
-  auto& comp = cfd->internal_comparator();
-  std::string last_key;
-  uint64_t last_file_number = uint64_t(-1);
-  IterKey iter_key;
-  ParsedInternalKey ikey;
-  struct {
-    uint64_t input = 0;
-    uint64_t garbage_type = 0;
-    uint64_t get_not_found = 0;
-    uint64_t file_number_mismatch = 0;
-  } counter;
-  std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
-  assert(!sub_compact->compaction->inputs()->empty());
-  blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
-  while (status.ok() && !cfd->IsDropped() && input->Valid()) {
-    ++counter.input;
-    Slice curr_key = input->key();
-    uint64_t curr_file_number = uint64_t(-1);
-    if (!ParseInternalKey(curr_key, &ikey)) {
-      status =
-          Status::Corruption("ProcessGarbageCollection invalid InternalKey");
-      break;
+    // I/O measurement variables
+    PerfLevel prev_perf_level = PerfLevel::kEnableTime;
+    uint64_t prev_write_nanos = 0;
+    uint64_t prev_fsync_nanos = 0;
+    uint64_t prev_range_sync_nanos = 0;
+    uint64_t prev_prepare_write_nanos = 0;
+    if (measure_io_stats_) {
+      prev_perf_level = GetPerfLevel();
+      SetPerfLevel(PerfLevel::kEnableTime);
+      prev_write_nanos = IOSTATS(write_nanos);
+      prev_fsync_nanos = IOSTATS(fsync_nanos);
+      prev_range_sync_nanos = IOSTATS(range_sync_nanos);
+      prev_prepare_write_nanos = IOSTATS(prepare_write_nanos);
     }
-    uint64_t blob_file_number = input->value().file_number();
-    FileMetaData* blob_meta;
-    auto find_cache = std::find_if(
-        blob_meta_cache.begin(), blob_meta_cache.end(),
-        [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
-          return pair.first == blob_file_number;
-        });
-    if (find_cache != blob_meta_cache.end()) {
-      blob_meta = find_cache->second;
-    } else {
-      auto find_dependence_map = dependence_map.find(blob_file_number);
-      if (find_dependence_map == dependence_map.end()) {
-        status =
-            Status::Corruption("ProcessGarbageCollection internal error !");
-        break;
-      }
-      blob_meta = find_dependence_map->second;
-      blob_meta_cache.emplace_back(blob_file_number, blob_meta);
-      assert(blob_meta->fd.GetNumber() == blob_file_number);
-    }
-    do {
-      if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
-        ++counter.garbage_type;
-        break;
-      }
-      iter_key.SetInternalKey(ikey.user_key, ikey.sequence, kValueTypeForSeek);
-      Status s;
-      ValueType type = kTypeDeletion;
-      SequenceNumber seq = kMaxSequenceNumber;
-      LazyBuffer value;
-      input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s, &type,
-                            &seq, &value, *blob_meta);
-      if (s.IsNotFound()) {
-        ++counter.get_not_found;
-        break;
-      } else if (!s.ok()) {
-        status = std::move(s);
-        break;
-      } else if (seq != ikey.sequence ||
-                 (type != kTypeValueIndex && type != kTypeMergeIndex)) {
-        ++counter.get_not_found;
-        break;
-      }
-      status = value.fetch();
-      if (!status.ok()) {
-        break;
-      }
-      uint64_t file_number = SeparateHelper::DecodeFileNumber(value.slice());
-      auto find = dependence_map.find(file_number);
-      if (find == dependence_map.end()) {
-        status = Status::Corruption("Separate value dependence missing");
-        break;
-      }
-      value = input->value();
-      if (find->second->fd.GetNumber() != value.file_number()) {
-        ++counter.file_number_mismatch;
-        break;
-      }
-      curr_file_number = value.file_number();
 
-      assert(sub_compact->blob_builder != nullptr);
-      assert(sub_compact->current_blob_output() != nullptr);
-      status = sub_compact->blob_builder->Add(curr_key, value);
-      if (!status.ok()) {
-        break;
-      }
-      sub_compact->current_blob_output()->meta.UpdateBoundaries(curr_key,
-                                                                ikey.sequence);
-      sub_compact->num_output_records++;
-    } while (false);
+    assert(sub_compact->start == nullptr);
+    assert(sub_compact->end == nullptr);
 
-    if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
-        (last_file_number & curr_file_number) != uint64_t(-1)) {
-      assert(last_file_number == uint64_t(-1) ||
-             curr_file_number == uint64_t(-1));
-      uint64_t valid_file_number = last_file_number & curr_file_number;
-      auto pinned_key = ArenaPinSlice(curr_key, &arena);
+    input->SeekToFirst();
+
+    Arena arena;
+    std::unordered_map<Slice, uint64_t, SliceHasher> conflict_map;
+    std::mutex conflict_map_mutex;
+
+    auto create_iter = [&](Arena* /* arena */) {
+      return versions_->MakeInputIterator(sub_compact->compaction, nullptr,
+                                          env_options_for_read_);
+    };
+    auto filter_conflict = [&](const Slice& ikey, const LazyBuffer& value) {
       std::lock_guard<std::mutex> lock(conflict_map_mutex);
-      conflict_map.emplace(pinned_key, valid_file_number);
+      auto find = conflict_map.find(ikey);
+      return find != conflict_map.end() && find->second != value.file_number();
+    };
+
+    LazyInternalIteratorWrapper second_pass_iter(
+        c_style_callback(create_iter), &create_iter,
+        c_style_callback(filter_conflict), &filter_conflict,
+        nullptr /* arena */, shutting_down_);
+
+    Status status = OpenCompactionOutputBlob(sub_compact);
+    if (!status.ok()) {
+      return;
     }
-    last_key.assign(curr_key.data(), curr_key.size());
-    last_file_number = curr_file_number;
+    sub_compact->blob_builder->SetSecondPassIterator(&second_pass_iter);
 
-    input->Next();
-  }
+    Version* input_version = sub_compact->compaction->input_version();
+    auto& dependence_map = input_version->storage_info()->dependence_map();
+    auto& comp = cfd->internal_comparator();
+    std::string last_key;
+    uint64_t last_file_number = kInvalidFileNumber;
+    IterKey iter_key;
+    ParsedInternalKey ikey;
+    struct {
+      uint64_t input = 0;
+      uint64_t garbage_type = 0;
+      uint64_t get_not_found = 0;
+      uint64_t file_number_mismatch = 0;
+    } counter;
 
-  if (status.ok() &&
-      (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
-    status = Status::ShutdownInProgress(
-        "Database shutdown or Column family drop during compaction");
-  }
-  if (status.ok()) {
-    status = input->status();
-  }
-  std::vector<uint64_t> inheritance_tree;
-  size_t inheritance_tree_pruge_count = 0;
-  if (status.ok()) {
-    status = BuildInheritanceTree(
-        *sub_compact->compaction->inputs(), dependence_map, input_version,
-        &inheritance_tree, &inheritance_tree_pruge_count);
-  }
-  Status s = FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
-  if (status.ok()) {
-    status = s;
-  }
-  if (status.ok()) {
-    auto& meta = sub_compact->blob_outputs.front().meta;
-    auto& inputs = *sub_compact->compaction->inputs();
-    assert(inputs.size() == 1 && inputs.front().level == -1);
-    auto& files = inputs.front().files;
-    ROCKS_LOG_INFO(
-        db_options_.info_log,
-        "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
-        " inputs from %zd files. %" PRIu64
-        " clear, %.2f%% estimation: [ %" PRIu64 " garbage type, %" PRIu64
-        " get not found, %" PRIu64
-        " file number mismatch ], inheritance tree: %zd -> %zd",
-        cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
-        files.size(), counter.input - meta.prop.num_entries,
-        sub_compact->compaction->num_antiquation() * 100. / counter.input,
-        counter.garbage_type, counter.get_not_found,
-        counter.file_number_mismatch,
-        meta.prop.inheritance.size() + inheritance_tree_pruge_count,
-        meta.prop.inheritance.size());
-    if ((std::find_if(files.begin(), files.end(),
-                      [](FileMetaData* f) {
-                        return f->marked_for_compaction;
-                      }) == files.end() &&
-         files.size() == 1 && counter.input == meta.prop.num_entries) ||
-        meta.prop.num_entries == 0) {
-      ROCKS_LOG_INFO(db_options_.info_log,
-                     "[%s] [JOB %d] Table #%" PRIu64
-                     " GC purge %s records, dropped",
-                     cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
-                     meta.prop.num_entries == 0 ? "whole" : "0");
-      std::string fname = TableFileName(
-          sub_compact->compaction->immutable_cf_options()->cf_paths,
-          meta.fd.GetNumber(), meta.fd.GetPathId());
-      env_->DeleteFile(fname);
-      sub_compact->blob_outputs.clear();
+    struct GC_RH_Status {
+      int counter = 0;
+      int gc_rh_end = 0;
+      int gc_rh_size = 0;
+      int last_gc_rh_size = 0;
+      int avg_size = 0;
+    };
+    std::map<uint64_t, GC_RH_Status> gc_rh_map;
+    const std::vector<FileMetaData*> gc_input_files =
+        sub_compact->compaction->inputs()->front().files;
+    for (FileMetaData* it : gc_input_files) {
+      uint64_t blob_file_number = it->fd.GetNumber();
+      valid_bits.emplace(blob_file_number, std::vector<bool>());
+      gc_rh_map[blob_file_number] = GC_RH_Status();
     }
-  }
 
-  if (measure_io_stats_) {
-    sub_compact->compaction_job_stats.file_write_nanos +=
-        IOSTATS(write_nanos) - prev_write_nanos;
-    sub_compact->compaction_job_stats.file_fsync_nanos +=
-        IOSTATS(fsync_nanos) - prev_fsync_nanos;
-    sub_compact->compaction_job_stats.file_range_sync_nanos +=
-        IOSTATS(range_sync_nanos) - prev_range_sync_nanos;
-    sub_compact->compaction_job_stats.file_prepare_write_nanos +=
-        IOSTATS(prepare_write_nanos) - prev_prepare_write_nanos;
-    if (prev_perf_level != PerfLevel::kEnableTime) {
-      SetPerfLevel(prev_perf_level);
+    std::vector<std::pair<uint64_t, FileMetaData*>> blob_meta_cache;
+    assert(!sub_compact->compaction->inputs()->empty());
+    blob_meta_cache.reserve(sub_compact->compaction->inputs()->front().size());
+    while (status.ok() && !cfd->IsDropped() && input->Valid()) {
+      ++counter.input;
+      Slice curr_key = input->key();
+      uint64_t curr_file_number = kInvalidFileNumber;
+      if (!ParseInternalKey(curr_key, &ikey)) {
+        status =
+            Status::Corruption("ProcessGarbageCollection invalid InternalKey");
+        break;
+      }
+      uint64_t blob_file_number = input->file_number();
+      FileMetaData* blob_meta;
+      auto find_cache = std::find_if(
+          blob_meta_cache.begin(), blob_meta_cache.end(),
+          [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
+            return pair.first == blob_file_number;
+          });
+      if (find_cache != blob_meta_cache.end()) {
+        blob_meta = find_cache->second;
+      } else {
+        auto find_dependence_map = dependence_map.find(blob_file_number);
+        if (find_dependence_map == dependence_map.end()) {
+          status =
+              Status::Corruption("ProcessGarbageCollection internal error !");
+          break;
+        }
+        blob_meta = find_dependence_map->second;
+        blob_meta_cache.emplace_back(blob_file_number, blob_meta);
+        assert(blob_meta->fd.GetNumber() == blob_file_number);
+      }
+      do {
+        if (ikey.type != kTypeValue && ikey.type != kTypeMerge) {
+          ++counter.garbage_type;
+          break;
+        }
+        iter_key.SetInternalKey(ikey.user_key, ikey.sequence,
+                                kValueTypeForSeek);
+        Status s;
+        ValueType type = kTypeDeletion;
+        SequenceNumber seq = kMaxSequenceNumber;
+        LazyBuffer value;
+        {
+          StopWatch getkey_sw(env_, nullptr, 0, &getkey_time, false, false);
+          getkey_count++;
+          uint64_t get_begin_reads = IOSTATS(bytes_read);
+#ifndef NDEBUG
+          std::cout << "[tid:" << std::this_thread::get_id()
+                    << "] GC check GetKey" << std::endl;
+#endif
+          input_version->GetKey(ikey.user_key, iter_key.GetInternalKey(), &s,
+                                &type, &seq, &value, *blob_meta);
+          uint64_t get_end_reads = IOSTATS(bytes_read);
+          RecordTick(stats_, GC_GETKEY_READ_BYTES,
+                     get_end_reads - get_begin_reads);
+        }
+
+        if (s.IsNotFound()) {
+          ++counter.get_not_found;
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        } else if (!s.ok()) {
+          status = std::move(s);
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        } else if (seq != ikey.sequence ||
+                   (type != kTypeValueIndex && type != kTypeMergeIndex)) {
+          ++counter.get_not_found;
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        }
+        status = value.fetch();
+        if (!status.ok()) {
+          valid_bits[blob_file_number].push_back(false);
+          break;
+        }
+        uint64_t file_number = SeparateHelper::DecodeFileNumber(value.slice());
+        auto find = dependence_map.find(file_number);
+        if (find == dependence_map.end()) {
+          status = Status::Corruption("Separate value dependence missing");
+          break;
+        }
+        valid_bits[blob_file_number].push_back(true);  // set blob bit to 1
+      } while (false);
+
+      if (counter.input > 1 && comp.Compare(curr_key, last_key) == 0 &&
+          (last_file_number & curr_file_number) != kInvalidFileNumber) {
+        assert(last_file_number == kInvalidFileNumber ||
+               curr_file_number == kInvalidFileNumber);
+        uint64_t valid_file_number = last_file_number & curr_file_number;
+        auto pinned_key = ArenaPinSlice(curr_key, &arena);
+        std::lock_guard<std::mutex> lock(conflict_map_mutex);
+        conflict_map.emplace(pinned_key, valid_file_number);
+      }
+      last_key.assign(curr_key.data(), curr_key.size());
+      last_file_number = curr_file_number;
+
+      {
+        StopWatch read_sw(env_, nullptr, 0, &read_time, false, false);
+        read_count++;
+        last_key.assign(curr_key.data(), curr_key.size());
+        last_file_number = curr_file_number;
+
+        input->Next();
+      }
+      if (shutting_down_ && shutting_down_->load(std::memory_order_relaxed)) {
+        status = Status::ShutdownInProgress();
+      }
     }
+
+    // **************** GC Write *****************************
+    input->SeekToFirst();
+    int def_rh_size = 0 * 1024;
+    // int def_rh_size = 512 * 1024;
+    int align_size = 4 * 1024;
+    while (status.ok() && !cfd->IsDropped() && input->Valid()) {
+      uint64_t blob_file_number = input->file_number();
+      GC_RH_Status& gc_rh_status = gc_rh_map[blob_file_number];
+      uint64_t curr_count = gc_rh_status.counter;
+      std::vector<bool> curr_bitset = valid_bits[blob_file_number];
+      if (!curr_bitset[curr_count]) {
+        gc_rh_status.counter++;
+        input->Next();
+        continue;
+      }
+
+      Slice curr_key = input->key();
+
+#ifdef GC_READAHEAD
+      FileMetaData* blob_meta = nullptr;
+      auto find_cache = std::find_if(
+          blob_meta_cache.begin(), blob_meta_cache.end(),
+          [blob_file_number](const std::pair<uint64_t, FileMetaData*>& pair) {
+            return pair.first == blob_file_number;
+          });
+      if (find_cache != blob_meta_cache.end()) {
+        blob_meta = find_cache->second;
+      }
+      gc_rh_status.avg_size =
+          blob_meta->compensated_file_size / blob_meta->prop.num_entries;
+      int rh_window_size = 0;
+      gc_rh_status.last_gc_rh_size = gc_rh_status.gc_rh_size;
+      if (curr_count >= gc_rh_status.gc_rh_end) {  // re-calc if exceeded
+        int key_size = curr_bitset.size();
+        for (int rh_end = curr_count; rh_end < key_size && curr_bitset[rh_end];
+             rh_end++) {
+          rh_window_size += 1;
+        }
+        assert(rh_window_size >= 1);
+        int check_window_size = def_rh_size / gc_rh_status.avg_size;
+        int rh_threshold = check_window_size * 0.5;
+        if (rh_window_size > check_window_size) {
+          gc_read_ahead_size = std::min(
+              rh_window_size * (gc_rh_status.avg_size / align_size + 1) *
+                  align_size,
+              2 * 1024 * 1024);
+        } else {
+          int valid_count = rh_window_size;
+          int invalid_count = 0;
+          int window_pointer = rh_window_size + curr_count;
+          int window_end = check_window_size + curr_count;
+          for (; window_pointer < window_end && window_pointer < key_size;
+               window_pointer++) {
+            if (curr_bitset[window_pointer]) {
+              if (++valid_count >= rh_threshold) {
+                rh_window_size = check_window_size;
+                gc_read_ahead_size = def_rh_size;
+                break;
+              }
+            } else {
+              if (++invalid_count > rh_threshold) {
+                gc_read_ahead_size = 0;
+                break;
+              }
+            }
+          }
+        }
+        gc_rh_status.gc_rh_end = curr_count + rh_window_size;
+        gc_rh_status.gc_rh_size = gc_read_ahead_size;
+      } else {  // in previous range
+        gc_read_ahead_size = gc_rh_status.gc_rh_size;
+      }
+      // std::cout << "[GC Readahead Size] " << gc_read_ahead_size << std::endl;
+      // gc_read_ahead_size = 2048 * 1024;
+      assert(gc_read_ahead_size == gc_rh_map[blob_file_number].gc_rh_size);
+      revert_rh_buffer =
+          gc_rh_status.last_gc_rh_size != gc_rh_status.gc_rh_size;
+#endif
+
+      LazyBuffer value;
+      do {
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] GC check valid and prepare fetch value" << std::endl;
+#endif
+        {
+          StopWatch fetch_val_sw(env_, nullptr, 0, &fetch_val_time, false,
+                                 false);
+          fetch_val_count++;
+          input->fetch_value();
+          value = input->value();
+        }
+#ifndef NDEBUG
+        std::cout << "[tid:" << std::this_thread::get_id()
+                  << "] GC fetch value size " << value.size() << std::endl;
+#endif
+        // input: curr_key, value
+        {
+          StopWatch write_sw(env_, nullptr, 0, &write_time, false, false);
+          write_count++;
+          assert(sub_compact->blob_builder != nullptr);
+          assert(sub_compact->current_blob_output() != nullptr);
+          status = sub_compact->blob_builder->Add(curr_key, value);
+        }
+        if (!status.ok()) {
+          gc_rh_status.counter++;
+          break;
+        }
+        sub_compact->current_blob_output()->meta.UpdateBoundaries(
+            curr_key, ikey.sequence);
+        sub_compact->num_output_records++;
+        gc_rh_status.counter++;
+      } while (false);
+      input->Next();
+    }
+
+    uint64_t gc_end_reads = IOSTATS(bytes_read);
+    uint64_t gc_end_writes = IOSTATS(bytes_written);
+    RecordTick(stats_, GC_READ_BYTES, gc_end_reads - gc_begin_reads);
+    RecordTick(stats_, GC_WRITE_BYTES, gc_end_writes - gc_begin_writes);
+
+    IOSTATS_RESET(bytes_read);
+    IOSTATS_RESET(bytes_written);
+
+    if (status.ok() &&
+        (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
+      status = Status::ShutdownInProgress(
+          "Database shutdown or Column family drop during compaction");
+    }
+    if (status.ok()) {
+      status = input->status();
+    }
+    std::vector<uint64_t> inheritance_tree;
+    size_t inheritance_tree_pruge_count = 0;
+    if (status.ok()) {
+      status = BuildInheritanceTree(
+          *sub_compact->compaction->inputs(), dependence_map, input_version,
+          &inheritance_tree, &inheritance_tree_pruge_count);
+    }
+    Status s =
+        FinishCompactionOutputBlob(status, sub_compact, inheritance_tree);
+    if (status.ok()) {
+      status = s;
+    }
+    if (status.ok()) {
+      auto& meta = sub_compact->blob_outputs.front().meta;
+      auto& inputs = *sub_compact->compaction->inputs();
+      assert(inputs.size() == 1 && inputs.front().level == -1);
+      auto& files = inputs.front().files;
+      uint64_t total_file_size = 0;
+      for (auto& file : files) {
+        total_file_size += file->raw_size();
+      }
+
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
+          " inputs from %zd files. %" PRIu64
+          " clear, %.2f%% entry estimation, raw %" PRIu64
+          " size estimation: [ %" PRIu64 " garbage type, %" PRIu64
+          " get not found, %" PRIu64
+          " file number mismatch ], inheritance tree: %zd -> %zd",
+          cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
+          files.size(), counter.input - meta.prop.num_entries,
+          sub_compact->compaction->num_antiquation() * 100. / counter.input,
+          total_file_size, counter.garbage_type, counter.get_not_found,
+          counter.file_number_mismatch,
+          meta.prop.inheritance.size() + inheritance_tree_pruge_count,
+          meta.prop.inheritance.size());
+
+      bool do_delete =
+          ((std::find_if(files.begin(), files.end(),
+                         [](FileMetaData* f) {
+                           return f->marked_for_compaction;
+                         }) == files.end() &&
+            files.size() == 1 && counter.input == meta.prop.num_entries) ||
+           meta.prop.num_entries == 0);
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ProcessGarbageCollection:test_delete", &do_delete);
+      if (do_delete) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "[%s] [JOB %d] Table #%" PRIu64
+                       " GC purge %s records, dropped",
+                       cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(),
+                       meta.prop.num_entries == 0 ? "whole" : "0");
+        std::string fname = TableFileName(
+            sub_compact->compaction->immutable_cf_options()->cf_paths,
+            meta.fd.GetNumber(), meta.fd.GetPathId());
+        env_->DeleteFile(fname);
+#ifndef ROCKSDB_LITE
+        EventHelpers::LogAndNotifyTableFileDeletion(
+            event_logger_, job_id_, meta.fd.GetNumber(), fname, status, dbname_,
+            cfd->ioptions()->listeners);
+#endif  // !ROCKSDB_LITE
+        sub_compact->blob_outputs.clear();
+      }
+    }
+
+    if (measure_io_stats_) {
+      sub_compact->compaction_job_stats.file_write_nanos +=
+          IOSTATS(write_nanos) - prev_write_nanos;
+      sub_compact->compaction_job_stats.file_fsync_nanos +=
+          IOSTATS(fsync_nanos) - prev_fsync_nanos;
+      sub_compact->compaction_job_stats.file_range_sync_nanos +=
+          IOSTATS(range_sync_nanos) - prev_range_sync_nanos;
+      sub_compact->compaction_job_stats.file_prepare_write_nanos +=
+          IOSTATS(prepare_write_nanos) - prev_prepare_write_nanos;
+      if (prev_perf_level != PerfLevel::kEnableTime) {
+        SetPerfLevel(prev_perf_level);
+      }
+    }
+
+    input.reset();
+    sub_compact->status = status;
   }
 
-  input.reset();
-  sub_compact->status = status;
+  MeasureTime(stats_, GC_ALL_TIME, total_gc_time);
+  RecordTick(stats_, GC_COUNT, 1);
+
+  MeasureTime(stats_, GC_GET_KEY_TIME, getkey_time);
+  RecordTick(stats_, GC_GETKEY_COUNT, getkey_count);
+
+  MeasureTime(stats_, GC_READ_TIME, read_time);
+  RecordTick(stats_, GC_READ_COUNT, read_count);
+
+  MeasureTime(stats_, GC_WRITE_TIME, write_time);
+  RecordTick(stats_, GC_WRITE_COUNT, write_count);
+
+  MeasureTime(stats_, GC_FETCH_VALUE_TIME, fetch_val_time);
+  RecordTick(stats_, GC_FETCH_VAL_COUNT, fetch_val_count);
+
+#ifdef GC_READAHEAD
+  gc_read_ahead_size = -1;
+  revert_rh_buffer = false;
+#endif
 }
 
 void CompactionJob::RecordDroppedKeys(
@@ -2911,6 +3594,7 @@ Status CompactionJob::OpenCompactionOutputFile(
   TEST_SYNC_POINT_CALLBACK("CompactionJob::OpenCompactionOutputFile",
                            &syncpoint_arg);
 #endif
+  bts_file_level = sub_compact->compaction->output_level();
   Status s = NewWritableFile(env_, fname, &writable_file, env_options_);
   if (!s.ok()) {
     ROCKS_LOG_ERROR(
@@ -2975,8 +3659,8 @@ Status CompactionJob::OpenCompactionOutputFile(
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(),
       sub_compact->compaction->output_level(), c->compaction_load(),
-      &sub_compact->compression_dict, skip_filters, output_file_creation_time,
-      0 /* oldest_key_time */,
+      &sub_compact->compression_dict, skip_filters, 0 /* meta_type */,
+      output_file_creation_time, 0 /* oldest_key_time */,
       sub_compact->compaction->compaction_type() == kMapCompaction
           ? kMapSst
           : kEssenceSst));
@@ -3007,6 +3691,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
   TEST_SYNC_POINT_CALLBACK("CompactionJob::OpenCompactionOutputFile",
                            &syncpoint_arg);
 #endif
+  bts_file_level = -1;
   Status s = NewWritableFile(env_, fname, &writable_file, env_options_);
   if (!s.ok()) {
     ROCKS_LOG_ERROR(
@@ -3064,7 +3749,7 @@ Status CompactionJob::OpenCompactionOutputBlob(
       cfd->GetName(), sub_compact->blob_outfile.get(),
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), -1 /* level */,
-      c->compaction_load(), nullptr, true /* skip_filters */,
+      c->compaction_load(), nullptr, true /* skip_filters */, 1 /* meta_type */,
       output_file_creation_time, 0 /* oldest_key_time */, kEssenceSst));
   LogFlush(db_options_.info_log);
   return s;
@@ -3082,6 +3767,8 @@ void CompactionJob::CleanupCompaction() {
       // May happen if we get a shutdown call in the middle of compaction
       sub_compact.builder->Abandon();
       sub_compact.builder.reset();
+    } else {
+      assert(!sub_status.ok() || sub_compact.outfile == nullptr);
     }
     for (const auto& out : sub_compact.outputs) {
       // If this file was inserted into the table cache then remove
@@ -3199,7 +3886,7 @@ void CompactionJob::UpdateCompactionJobStats(
     }
   }
 #else
-  (void)stats;
+  static_cast<void>(stats);
 #endif  // !ROCKSDB_LITE
 }
 
@@ -3224,9 +3911,8 @@ void CompactionJob::LogCompaction() {
                    CompactionTypeName(compaction->compaction_type()), scratch);
     // build event logger report
     auto stream = event_logger_->Log();
-    stream << "job" << job_id_ << "event"
-           << "compaction_started"
-           << "cf_name" << cfd->GetName() << "compaction_reason"
+    stream << "job" << job_id_ << "event" << "compaction_started" << "cf_name"
+           << cfd->GetName() << "compaction_reason"
            << GetCompactionReasonString(compaction->compaction_reason());
     for (size_t i = 0; i < compaction->num_input_levels(); ++i) {
       stream << ("files_L" + ToString(compaction->level(i)));

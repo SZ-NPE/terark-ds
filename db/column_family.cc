@@ -38,6 +38,11 @@
 #include "util/compression.h"
 #include "util/sst_file_manager_impl.h"
 
+
+#ifdef DISABLE_READAHEAD
+#include <iostream>
+#endif   
+
 namespace TERARKDB_NAMESPACE {
 
 ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
@@ -177,6 +182,13 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
 
 ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
                                     const ColumnFamilyOptions& src) {
+  #ifdef DISABLE_READAHEAD
+    std::cout << "define DISABLE_READAHEAD" << std::endl;
+  #endif
+  #ifdef GC_READAHEAD
+    std::cout << "define GC_READAHEAD for gc" << std::endl;
+  #endif  
+
   ColumnFamilyOptions result = src;
   size_t clamp_max = std::conditional<
       sizeof(size_t) == 4, std::integral_constant<size_t, 0xffffffff>,
@@ -331,9 +343,9 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.blob_large_key_ratio < 0) {
     result.blob_large_key_ratio = 0;
   }
-  if (result.blob_gc_ratio > 0.5) {
-    result.blob_gc_ratio = 0.5;
-  }
+  // if (result.blob_gc_ratio > 0.5) {
+  //   result.blob_gc_ratio = 0.5;
+  // }
   if (result.blob_gc_ratio < 0) {
     result.blob_gc_ratio = 0;
   }
@@ -691,7 +703,8 @@ int GetL0ThresholdSpeedupCompaction(int level0_file_num_compaction_trigger,
 std::pair<WriteStallCondition, ColumnFamilyData::WriteStallCause>
 ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files, int read_amp,
-    uint64_t num_compaction_needed_bytes, int num_levels,
+    uint64_t num_compaction_needed_bytes, uint64_t total_blob_file_size,
+    double total_garbage_ratio, int num_levels,
     const MutableCFOptions& mutable_cf_options) {
   if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
@@ -708,6 +721,16 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
              read_amp - num_levels >=
                  mutable_cf_options.level0_stop_writes_trigger) {
     return {WriteStallCondition::kStopped, WriteStallCause::kReadAmpLimit};
+  } else if (total_garbage_ratio >=
+             mutable_cf_options.garbage_ratio_stop_writes_trigger) {
+    return {WriteStallCondition::kStopped, WriteStallCause::kGarbageRatioLimit};
+  // } else if (total_garbage_ratio >=
+  //            mutable_cf_options.blob_gc_ratio && 
+  //            mutable_cf_options.blob_file_bytes_limit > 0 && 
+  //            total_blob_file_size >= mutable_cf_options.blob_file_bytes_limit) {
+  } else if (mutable_cf_options.blob_file_bytes_limit > 0 && 
+             total_blob_file_size >= mutable_cf_options.blob_file_bytes_limit) {
+    return {WriteStallCondition::kStopped, WriteStallCause::kBlobFileBytes};
   } else if (mutable_cf_options.max_write_buffer_number > 3 &&
              num_unflushed_memtables >=
                  mutable_cf_options.max_write_buffer_number - 1) {
@@ -743,8 +766,9 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
         imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
         int(vstorage->read_amplification()),
-        vstorage->estimated_compaction_needed_bytes(), ioptions_.num_levels,
-        mutable_cf_options);
+        vstorage->estimated_compaction_needed_bytes(),
+        vstorage->total_db_file_size(), vstorage->total_garbage_ratio(),
+        ioptions_.num_levels, mutable_cf_options);
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -791,6 +815,25 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
           "[%s] Stopping writes because we have %f times read amplification "
           "(waiting for compaction)",
           name_.c_str(), vstorage->read_amplification());
+    } else if (write_stall_condition == WriteStallCondition::kStopped &&
+               write_stall_cause == WriteStallCause::kGarbageRatioLimit) {
+      write_controller_token_ = write_controller->GetStopToken();
+      internal_stats_->AddCFStats(InternalStats::GARBAGE_RATIO_LIMIT_STOPS, 1);
+      ROCKS_LOG_WARN(ioptions_.info_log,
+                     "[%s] Stopping writes because of total garbage ratio %f"
+                     "(waiting for garbage collection)",
+                     name_.c_str(), vstorage->total_garbage_ratio());
+    } else if (write_stall_condition == WriteStallCondition::kStopped &&
+               write_stall_cause == WriteStallCause::kBlobFileBytes) {
+      write_controller_token_ = write_controller->GetStopToken();
+      internal_stats_->AddCFStats(InternalStats::BLOB_FILE_BYTES_LIMIT_STOPS,
+                                  1);
+      ROCKS_LOG_WARN(
+          ioptions_.info_log,
+          "[%s] Stopping writes because of total db file bytes %" PRIu64 
+          "and total garbage ratio %f"
+          "(waiting for garbage collection)",
+          name_.c_str(), vstorage->total_db_file_size(), vstorage->total_garbage_ratio());
     } else if (write_stall_condition == WriteStallCondition::kDelayed &&
                write_stall_cause == WriteStallCause::kMemtableLimit) {
       write_controller_token_ =
@@ -973,9 +1016,18 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
+  double dynamic_blob_gc_ratio = mutable_cf_options_.blob_gc_ratio;
+  if (mutable_cf_options_.blob_file_bytes_limit > 0 && 
+        vstorage->total_db_file_size() >= mutable_cf_options_.blob_file_bytes_limit) {
+    dynamic_blob_gc_ratio = 1e-15;
+    ROCKS_LOG_INFO(
+            ioptions_.info_log,
+            "[GC Stall] set dynamic blob gc ratio in NeedsGarbageCollection %f and current total_garbage_ratio is %f",
+            dynamic_blob_gc_ratio, vstorage->total_garbage_ratio());
+  }
   return !vstorage->IsPickGarbageCollectionFail() &&
          (vstorage->blob_marked_for_compaction() ||
-          vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio);
+          vstorage->total_garbage_ratio() >= dynamic_blob_gc_ratio);
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -998,8 +1050,17 @@ Compaction* ColumnFamilyData::PickGarbageCollection(
     const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
   StopWatch sw(ioptions_.env, ioptions_.statistics,
                PICK_GARBAGE_COLLECTION_TIME);
+  double dynamic_blob_gc_ratio = mutable_options.blob_gc_ratio;
+  if (mutable_options.blob_file_bytes_limit > 0 && 
+        current_->storage_info()->total_db_file_size() >= mutable_options.blob_file_bytes_limit) {
+    dynamic_blob_gc_ratio = 1e-15;
+    ROCKS_LOG_INFO(
+            ioptions_.info_log,
+            "[GC Stall] set dynamic blob gc ratio %f when pick",
+            dynamic_blob_gc_ratio);
+  }
   auto* result = compaction_picker_->PickGarbageCollection(
-      GetName(), mutable_options, current_->storage_info(), log_buffer);
+      GetName(), mutable_options, dynamic_blob_gc_ratio, current_->storage_info(), log_buffer);
   if (result != nullptr) {
     result->SetInputVersion(current_);
     result->set_compaction_load(0);

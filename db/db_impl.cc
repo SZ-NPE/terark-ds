@@ -2022,6 +2022,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
   StopWatch sw(env_, stats_, DB_GET);
   PERF_TIMER_GUARD(get_snapshot_time);
 
+  DBOperationTypeGuard op_guard(kOpTypeFG);
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
   auto cfd = cfh->cfd();
 
@@ -2796,6 +2797,7 @@ Iterator* DBImpl::NewIterator(const ReadOptions& read_options,
   }
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
   auto cfd = cfh->cfd();
+  DBOperationTypeGuard op_guard(kOpTypeFG);
   ReadCallback* read_callback = nullptr;  // No read callback provided.
   if (read_options.tailing) {
 #ifdef ROCKSDB_LITE
